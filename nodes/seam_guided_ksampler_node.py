@@ -60,6 +60,7 @@ class SeamGuidedKSamplerNode:
                 "seam_noise_ramp_curve": ("FLOAT", {"default": 1.5, "min": 0.25, "max": 8.0, "step": 0.1}),
                 "seam_start_step": ("INT", {"default": 1, "min": 1, "max": 200, "step": 1}),
                 "seam_end_step": ("INT", {"default": 0, "min": 0, "max": 200, "step": 1}),
+                "boundary_only_guidance": ("BOOLEAN", {"default": False}),
                 "anchor_width_px": ("INT", {"default": 3, "min": 1, "max": 256, "step": 1}),
                 "anchor_falloff_px": ("INT", {"default": 16, "min": 1, "max": 512, "step": 1}),
                 "process_left": ("BOOLEAN", {"default": True}),
@@ -97,6 +98,7 @@ class SeamGuidedKSamplerNode:
         seam_noise_ramp_curve,
         seam_start_step,
         seam_end_step,
+        boundary_only_guidance,
         anchor_width_px,
         anchor_falloff_px,
         process_left,
@@ -188,7 +190,8 @@ class SeamGuidedKSamplerNode:
             print(
                 f"[SeamGuidedKSampler] steps={total_steps} denoise={denoise:.3f} cfg={cfg:.3f} "
                 f"mode={noise_mode} seam_strength={seam_noise_strength:.3f} "
-                f"sides={','.join(anchor_state['sides']) or 'none'}"
+                f"sides={','.join(anchor_state['sides']) or 'none'} "
+                f"boundary_only={bool(boundary_only_guidance)}"
             )
 
         active_start = max(1, int(seam_start_step))
@@ -246,6 +249,7 @@ class SeamGuidedKSamplerNode:
                         anchor_state,
                         seam_noise_strength * temporal,
                         mode=noise_mode,
+                        boundary_only=bool(boundary_only_guidance),
                     )
                     if debug:
                         print(

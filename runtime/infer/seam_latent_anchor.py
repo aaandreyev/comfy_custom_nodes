@@ -416,6 +416,7 @@ def apply_seam_latent_guidance(
     effective_strength: float,
     *,
     mode: str = "mean_shift",
+    boundary_only: bool = False,
     variance_limit: float = 2.0,
 ) -> torch.Tensor:
     if effective_strength <= 0.0 or not anchor_state.get("sides"):
@@ -433,6 +434,9 @@ def apply_seam_latent_guidance(
     total_weight = torch.zeros(x.shape[0], 1, x.shape[-2], x.shape[-1], device=x.device, dtype=x.dtype)
     for side in anchor_state["sides"]:
         weight = _match_batch(weights[side], x.shape[0]).to(device=x.device, dtype=x.dtype)
+        if boundary_only:
+            # Sharpen the falloff so direct guidance stays close to the seam edge.
+            weight = weight.clamp(0.0, 1.0).pow(2.0)
         anchor_profile = _match_batch(profiles[side], x.shape[0]).to(device=x.device, dtype=x.dtype)
         anchor_profile = _match_channels(anchor_profile, x.shape[1])
         current_profile = _extract_inner_profile(x, bbox, side, sample_widths[side], reduce)
