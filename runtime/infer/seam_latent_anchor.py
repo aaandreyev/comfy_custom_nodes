@@ -131,6 +131,129 @@ def _extract_inner_profile(
     return _reduce_strip(strip, side, reduce)
 
 
+def _reduce_strip_std(strip: torch.Tensor, side: Side) -> torch.Tensor:
+    if side in {"left", "right"}:
+        dim = -1
+    else:
+        dim = -2
+    return torch.std(strip, dim=dim, keepdim=True, unbiased=False)
+
+
+def _extract_outer_std(
+    anchor_latent: torch.Tensor,
+    bbox: tuple[int, int, int, int],
+    side: Side,
+    outer_width: int,
+) -> torch.Tensor | None:
+    _, _, height, width = anchor_latent.shape
+    x0, y0, x1, y1 = bbox
+    if side == "left":
+        width_px = min(int(outer_width), x0)
+        if width_px <= 0:
+            return None
+        strip = anchor_latent[:, :, y0:y1, x0 - width_px : x0]
+    elif side == "right":
+        width_px = min(int(outer_width), width - x1)
+        if width_px <= 0:
+            return None
+        strip = anchor_latent[:, :, y0:y1, x1 : x1 + width_px]
+    elif side == "top":
+        width_px = min(int(outer_width), y0)
+        if width_px <= 0:
+            return None
+        strip = anchor_latent[:, :, y0 - width_px : y0, x0:x1]
+    elif side == "bottom":
+        width_px = min(int(outer_width), height - y1)
+        if width_px <= 0:
+            return None
+        strip = anchor_latent[:, :, y1 : y1 + width_px, x0:x1]
+    else:
+        raise ValueError(f"unsupported side: {side}")
+    return _reduce_strip_std(strip, side)
+
+
+def _extract_inner_std(
+    x: torch.Tensor,
+    bbox: tuple[int, int, int, int],
+    side: Side,
+    sample_width: int,
+) -> torch.Tensor | None:
+    _, _, height, width = x.shape
+    x0, y0, x1, y1 = bbox
+    if side == "left":
+        band = min(int(sample_width), max(x1 - x0, 0))
+        if band <= 0:
+            return None
+        strip = x[:, :, y0:y1, x0 : x0 + band]
+    elif side == "right":
+        band = min(int(sample_width), max(x1 - x0, 0))
+        if band <= 0:
+            return None
+        strip = x[:, :, y0:y1, x1 - band : x1]
+    elif side == "top":
+        band = min(int(sample_width), max(y1 - y0, 0))
+        if band <= 0:
+            return None
+        strip = x[:, :, y0 : y0 + band, x0:x1]
+    elif side == "bottom":
+        band = min(int(sample_width), max(y1 - y0, 0))
+        if band <= 0:
+            return None
+        strip = x[:, :, y1 - band : y1, x0:x1]
+    else:
+        raise ValueError(f"unsupported side: {side}")
+    return _reduce_strip_std(strip, side)
+
+
+def _extract_inner_band(
+    x: torch.Tensor,
+    bbox: tuple[int, int, int, int],
+    side: Side,
+    band_size: int,
+) -> torch.Tensor | None:
+    _, _, height, width = x.shape
+    x0, y0, x1, y1 = bbox
+    if side == "left":
+        if band_size <= 0:
+            return None
+        return x[:, :, y0:y1, x0 : x0 + band_size]
+    if side == "right":
+        if band_size <= 0:
+            return None
+        return x[:, :, y0:y1, x1 - band_size : x1]
+    if side == "top":
+        if band_size <= 0:
+            return None
+        return x[:, :, y0 : y0 + band_size, x0:x1]
+    if side == "bottom":
+        if band_size <= 0:
+            return None
+        return x[:, :, y1 - band_size : y1, x0:x1]
+    raise ValueError(f"unsupported side: {side}")
+
+
+def _place_band(
+    band: torch.Tensor,
+    bbox: tuple[int, int, int, int],
+    side: Side,
+    full_shape: tuple[int, int, int, int],
+) -> torch.Tensor:
+    batch, channels, height, width = full_shape
+    target = torch.zeros(batch, channels, height, width, device=band.device, dtype=band.dtype)
+    x0, y0, x1, y1 = bbox
+    if side == "left":
+        target[:, :, y0:y1, x0 : x0 + band.shape[-1]] = band
+    elif side == "right":
+        target[:, :, y0:y1, x1 - band.shape[-1] : x1] = band
+    elif side == "top":
+        target[:, :, y0 : y0 + band.shape[-2], x0:x1] = band
+    elif side == "bottom":
+        target[:, :, y1 - band.shape[-2] : y1, x0:x1] = band
+    else:
+        raise ValueError(f"unsupported side: {side}")
+    return target
+
+
 def _place_profile(
     profile: torch.Tensor,
     bbox: tuple[int, int, int, int],
@@ -197,12 +320,17 @@ def prepare_seam_anchor_state(
     per_side_weights: dict[Side, torch.Tensor] = {}
     per_side_band_sizes: dict[Side, int] = {}
     per_side_sample_widths: dict[Side, int] = {}
+    per_side_std_profiles: dict[Side, torch.Tensor] = {}
 
     for side in sides:
         profile = _extract_outer_profile(anchor_latent, bbox, side, anchor_width_px, reduce)
+        std_profile = _extract_outer_std(anchor_latent, bbox, side, anchor_width_px)
         if profile is None:
             continue
         profile = _smooth_profile(profile, side, kernel_size=profile_smooth_kernel)
+        if std_profile is None:
+            continue
+        std_profile = _smooth_profile(std_profile, side, kernel_size=profile_smooth_kernel)
         if side in {"left", "right"}:
             band_size = min(int(anchor_falloff_px), max(x1 - x0, 0))
             sample_width = min(int(anchor_width_px), max(x1 - x0, 0))
@@ -225,12 +353,14 @@ def prepare_seam_anchor_state(
         per_side_weights[side] = weight
         per_side_band_sizes[side] = int(band_size)
         per_side_sample_widths[side] = int(sample_width)
+        per_side_std_profiles[side] = std_profile
 
     return {
         "bbox": bbox,
         "mask": mask,
         "sides": tuple(per_side_profiles.keys()),
         "profiles": per_side_profiles,
+        "std_profiles": per_side_std_profiles,
         "weights": per_side_weights,
         "band_sizes": per_side_band_sizes,
         "sample_widths": per_side_sample_widths,
@@ -278,3 +408,71 @@ def apply_seam_anchor_correction(
     merged = torch.where(total_weight > 1.0, weighted_sum / total_weight.clamp_min(1e-8), weighted_sum)
     merged = torch.where(total_weight > 1.0, merged * coverage, merged)
     return denoised + merged * float(effective_strength)
+
+
+def apply_seam_latent_guidance(
+    x: torch.Tensor,
+    anchor_state: dict,
+    effective_strength: float,
+    *,
+    mode: str = "mean_shift",
+    variance_limit: float = 2.0,
+) -> torch.Tensor:
+    if effective_strength <= 0.0 or not anchor_state.get("sides"):
+        return x
+
+    bbox = anchor_state["bbox"]
+    reduce = anchor_state["reduce"]
+    profiles = anchor_state["profiles"]
+    std_profiles = anchor_state["std_profiles"]
+    weights = anchor_state["weights"]
+    band_sizes = anchor_state["band_sizes"]
+    sample_widths = anchor_state["sample_widths"]
+
+    weighted_sum = torch.zeros_like(x)
+    total_weight = torch.zeros(x.shape[0], 1, x.shape[-2], x.shape[-1], device=x.device, dtype=x.dtype)
+    for side in anchor_state["sides"]:
+        weight = _match_batch(weights[side], x.shape[0]).to(device=x.device, dtype=x.dtype)
+        anchor_profile = _match_batch(profiles[side], x.shape[0]).to(device=x.device, dtype=x.dtype)
+        anchor_profile = _match_channels(anchor_profile, x.shape[1])
+        current_profile = _extract_inner_profile(x, bbox, side, sample_widths[side], reduce)
+        if current_profile is None:
+            continue
+        current_profile = _match_batch(current_profile, x.shape[0]).to(device=x.device, dtype=x.dtype)
+        current_profile = _match_channels(current_profile, x.shape[1])
+        if mode == "matched_noise":
+            inner_band = _extract_inner_band(x, bbox, side, band_sizes[side])
+            if inner_band is None:
+                continue
+            current_std = _extract_inner_std(x, bbox, side, sample_widths[side])
+            anchor_std = _match_batch(std_profiles[side], x.shape[0]).to(device=x.device, dtype=x.dtype)
+            anchor_std = _match_channels(anchor_std, x.shape[1])
+            if current_std is None:
+                continue
+            current_std = _match_batch(current_std, x.shape[0]).to(device=x.device, dtype=x.dtype)
+            current_std = _match_channels(current_std, x.shape[1])
+            scale = (anchor_std / current_std.clamp_min(1e-4)).clamp(1.0 / variance_limit, variance_limit)
+            if side in {"left", "right"}:
+                mean_exp = anchor_profile.expand(-1, -1, -1, band_sizes[side])
+                cur_mean_exp = current_profile.expand(-1, -1, -1, band_sizes[side])
+                scale_exp = scale.expand(-1, -1, -1, band_sizes[side])
+            else:
+                mean_exp = anchor_profile.expand(-1, -1, band_sizes[side], -1)
+                cur_mean_exp = current_profile.expand(-1, -1, band_sizes[side], -1)
+                scale_exp = scale.expand(-1, -1, band_sizes[side], -1)
+            matched_band = (inner_band - cur_mean_exp) * scale_exp + mean_exp
+            delta_map = _place_band(matched_band - inner_band, bbox, side, x.shape)
+        else:
+            correction_profile = anchor_profile - current_profile
+            delta_map = _place_profile(correction_profile, bbox, side, band_sizes[side], x.shape)
+        if weight.shape[-2:] != x.shape[-2:]:
+            weight = F.interpolate(weight, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        weighted_sum = weighted_sum + delta_map * weight
+        total_weight = total_weight + weight
+
+    if float(total_weight.max().item()) <= 0.0:
+        return x
+    coverage = total_weight.clamp(0.0, 1.0)
+    merged = torch.where(total_weight > 1.0, weighted_sum / total_weight.clamp_min(1e-8), weighted_sum)
+    merged = torch.where(total_weight > 1.0, merged * coverage, merged)
+    return x + merged * float(effective_strength)
