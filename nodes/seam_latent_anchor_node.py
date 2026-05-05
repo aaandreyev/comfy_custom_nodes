@@ -22,6 +22,7 @@ class SeamLatentAnchorNode:
                 "process_bottom": ("BOOLEAN", {"default": True}),
             },
             "optional": {
+                "topology_mask": ("MASK",),
                 "ramp_curve": ("FLOAT", {"default": 1.5, "min": 0.5, "max": 8.0, "step": 0.1}),
                 "profile_reduce": (["mean", "median"], {"default": "mean"}),
                 "debug": ("BOOLEAN", {"default": False}),
@@ -44,6 +45,7 @@ class SeamLatentAnchorNode:
         process_right,
         process_top,
         process_bottom,
+        topology_mask=None,
         ramp_curve=1.5,
         profile_reduce="mean",
         debug=False,
@@ -54,6 +56,7 @@ class SeamLatentAnchorNode:
         anchor_state = prepare_seam_anchor_state(
             samples,
             mask,
+            topology_mask=topology_mask,
             anchor_width_px=int(anchor_width_px),
             anchor_falloff_px=int(anchor_falloff_px),
             process_left=bool(process_left),
@@ -62,7 +65,7 @@ class SeamLatentAnchorNode:
             process_bottom=bool(process_bottom),
             reduce=str(profile_reduce),
         )
-        if not anchor_state["sides"]:
+        if not anchor_state["sides"] and not anchor_state.get("extra_contributions"):
             if debug:
                 print("[SeamLatentAnchor] No valid seam context found; node inactive.")
             return (model,)
@@ -107,11 +110,15 @@ class SeamLatentAnchorNode:
             if _debug and s != _state["last_sigma_logged"]:
                 _state["last_sigma_logged"] = s
                 applied = (corrected - denoised).abs().mean().item()
+                base_weight_max = max(
+                    [float(w.max().item()) for w in _anchor_state["weights"].values()] or [0.0]
+                )
                 print(
                     f"[SeamLatentAnchor] step={_state['step']} sigma={s:.4f} "
                     f"progress={progress:.3f} effective={effective:.3f} "
-                    f"weight_max={max(float(w.max().item()) for w in _anchor_state['weights'].values()):.3f} "
+                    f"weight_max={base_weight_max:.3f} "
                     f"sides={','.join(_anchor_state['sides']) or 'none'} "
+                    f"present={','.join(_anchor_state.get('present_positions', ())) or 'auto'} "
                     f"applied={applied:.5f}"
                 )
             return corrected

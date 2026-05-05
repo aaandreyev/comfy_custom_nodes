@@ -69,6 +69,7 @@ class SeamGuidedKSamplerNode:
                 "process_bottom": ("BOOLEAN", {"default": True}),
             },
             "optional": {
+                "topology_mask": ("MASK",),
                 "guidance_embed": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.1}),
                 "profile_reduce": (["mean", "median"], {"default": "mean"}),
                 "noise_mode": (["mean_shift", "matched_noise"], {"default": "mean_shift"}),
@@ -105,6 +106,7 @@ class SeamGuidedKSamplerNode:
         process_right,
         process_top,
         process_bottom,
+        topology_mask=None,
         guidance_embed=1.0,
         profile_reduce="mean",
         noise_mode="mean_shift",
@@ -118,6 +120,7 @@ class SeamGuidedKSamplerNode:
         anchor_state = prepare_seam_anchor_state(
             anchor_samples,
             mask,
+            topology_mask=topology_mask,
             anchor_width_px=int(anchor_width_px),
             anchor_falloff_px=int(anchor_falloff_px),
             process_left=bool(process_left),
@@ -191,6 +194,7 @@ class SeamGuidedKSamplerNode:
                 f"[SeamGuidedKSampler] steps={total_steps} denoise={denoise:.3f} cfg={cfg:.3f} "
                 f"mode={noise_mode} seam_strength={seam_noise_strength:.3f} "
                 f"sides={','.join(anchor_state['sides']) or 'none'} "
+                f"present={','.join(anchor_state.get('present_positions', ())) or 'auto'} "
                 f"boundary_only={bool(boundary_only_guidance)}"
             )
 
