@@ -58,6 +58,8 @@ class SeamGuidedKSamplerNode:
                 "max_shift": ("FLOAT", {"default": 1.15, "min": 0.0, "max": 10.0, "step": 0.01}),
                 "seam_noise_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "seam_noise_ramp_curve": ("FLOAT", {"default": 1.5, "min": 0.25, "max": 8.0, "step": 0.1}),
+                "seam_start_step": ("INT", {"default": 1, "min": 1, "max": 200, "step": 1}),
+                "seam_end_step": ("INT", {"default": 0, "min": 0, "max": 200, "step": 1}),
                 "anchor_width_px": ("INT", {"default": 3, "min": 1, "max": 256, "step": 1}),
                 "anchor_falloff_px": ("INT", {"default": 16, "min": 1, "max": 512, "step": 1}),
                 "process_left": ("BOOLEAN", {"default": True}),
@@ -93,6 +95,8 @@ class SeamGuidedKSamplerNode:
         max_shift,
         seam_noise_strength,
         seam_noise_ramp_curve,
+        seam_start_step,
+        seam_end_step,
         anchor_width_px,
         anchor_falloff_px,
         process_left,
@@ -187,6 +191,9 @@ class SeamGuidedKSamplerNode:
                 f"sides={','.join(anchor_state['sides']) or 'none'}"
             )
 
+        active_start = max(1, int(seam_start_step))
+        active_end = total_steps if int(seam_end_step) <= 0 else min(int(seam_end_step), total_steps)
+
         with torch.no_grad():
             for i in trange(total_steps, desc="Seam Guided KSampler"):
                 comfy.model_management.throw_exception_if_processing_interrupted()
@@ -226,8 +233,14 @@ class SeamGuidedKSamplerNode:
 
                 x = x + (t_prev - t_curr) * pred
 
+                step_num = i + 1
                 temporal = _seam_temporal_strength(i, total_steps, float(seam_noise_ramp_curve))
-                if seam_noise_strength > 0.0 and anchor_state["sides"] and temporal > 1e-5:
+                if (
+                    seam_noise_strength > 0.0
+                    and anchor_state["sides"]
+                    and temporal > 1e-5
+                    and active_start <= step_num <= active_end
+                ):
                     x = apply_seam_latent_guidance(
                         x,
                         anchor_state,
