@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from ..runtime.infer.seam_latent_anchor import apply_seam_anchor_correction, prepare_seam_anchor_maps
+from ..runtime.infer.seam_latent_anchor import apply_seam_anchor_correction, prepare_seam_anchor_state
 
 
 class SeamLatentAnchorNode:
@@ -51,7 +51,7 @@ class SeamLatentAnchorNode:
         if strength <= 0.0:
             return (model,)
         samples = anchor_latent["samples"].float()
-        target_map, weight_map, debug_data = prepare_seam_anchor_maps(
+        anchor_state = prepare_seam_anchor_state(
             samples,
             mask,
             anchor_width_px=int(anchor_width_px),
@@ -62,17 +62,15 @@ class SeamLatentAnchorNode:
             process_bottom=bool(process_bottom),
             reduce=str(profile_reduce),
         )
-        if float(weight_map.max().item()) <= 0.0:
+        if not anchor_state["sides"]:
             if debug:
                 print("[SeamLatentAnchor] No valid seam context found; node inactive.")
             return (model,)
 
-        _target_map = target_map
-        _weight_map = weight_map
+        _anchor_state = anchor_state
         _strength = float(strength)
         _curve = max(float(ramp_curve), 1e-3)
         _debug = bool(debug)
-        _debug_data = debug_data
         _state = {
             "sigma_max": None,
             "last_sigma_logged": None,
@@ -96,27 +94,25 @@ class SeamLatentAnchorNode:
             )
             _state["step"] += 1
             step_progress = 1.0 - 0.5 ** _state["step"]
-            progress = max(sigma_progress, step_progress)
-            curved = progress ** (1.0 / _curve)
+            progress = 0.65 * step_progress + 0.35 * sigma_progress
+            curved = 1.0 - (1.0 - progress) ** _curve
             effective = _strength * curved
             if effective < 1e-5:
                 return denoised
             corrected = apply_seam_anchor_correction(
                 denoised,
-                _target_map,
-                _weight_map,
+                _anchor_state,
                 effective,
             )
             if _debug and s != _state["last_sigma_logged"]:
                 _state["last_sigma_logged"] = s
-                drift = (_target_map.to(denoised.device, denoised.dtype) - denoised[: _target_map.shape[0]]).abs().mean().item()
                 applied = (corrected - denoised).abs().mean().item()
                 print(
                     f"[SeamLatentAnchor] step={_state['step']} sigma={s:.4f} "
                     f"progress={progress:.3f} effective={effective:.3f} "
-                    f"weight_max={float(_weight_map.max().item()):.3f} "
-                    f"sides={','.join(_debug_data['sides']) or 'none'} "
-                    f"drift={drift:.5f} applied={applied:.5f}"
+                    f"weight_max={max(float(w.max().item()) for w in _anchor_state['weights'].values()):.3f} "
+                    f"sides={','.join(_anchor_state['sides']) or 'none'} "
+                    f"applied={applied:.5f}"
                 )
             return corrected
 

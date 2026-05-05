@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn.functional as F
 
@@ -10,12 +8,6 @@ from .merge_bands import build_seam_local_weight_map
 
 
 Side = str
-
-
-@dataclass(frozen=True)
-class SeamAnchorDebug:
-    bbox: tuple[int, int, int, int]
-    sides: tuple[Side, ...]
 
 
 def _match_batch(x: torch.Tensor, batch: int) -> torch.Tensor:
@@ -44,58 +36,125 @@ def _reduce_strip(strip: torch.Tensor, side: Side, reduce: str) -> torch.Tensor:
     return torch.mean(strip, dim=dim, keepdim=True)
 
 
-def _build_side_target_map(
+def _smooth_profile(profile: torch.Tensor, side: Side, kernel_size: int = 5) -> torch.Tensor:
+    kernel_size = max(1, int(kernel_size))
+    if kernel_size <= 1:
+        return profile
+    if side in {"left", "right"}:
+        length = profile.shape[-2]
+        if length < 3:
+            return profile
+        kernel_size = min(kernel_size, length if length % 2 == 1 else length - 1)
+        if kernel_size <= 1:
+            return profile
+        pad = kernel_size // 2
+        x = profile.squeeze(-1).reshape(-1, 1, length)
+        x = F.avg_pool1d(F.pad(x, (pad, pad), mode="replicate"), kernel_size=kernel_size, stride=1)
+        return x.reshape(profile.shape[0], profile.shape[1], length, 1)
+    length = profile.shape[-1]
+    if length < 3:
+        return profile
+    kernel_size = min(kernel_size, length if length % 2 == 1 else length - 1)
+    if kernel_size <= 1:
+        return profile
+    pad = kernel_size // 2
+    x = profile.squeeze(-2).reshape(-1, 1, length)
+    x = F.avg_pool1d(F.pad(x, (pad, pad), mode="replicate"), kernel_size=kernel_size, stride=1)
+    return x.reshape(profile.shape[0], profile.shape[1], 1, length)
+
+
+def _extract_outer_profile(
     anchor_latent: torch.Tensor,
     bbox: tuple[int, int, int, int],
     side: Side,
-    anchor_width_px: int,
-    anchor_falloff_px: int,
+    outer_width: int,
     reduce: str,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    batch, channels, height, width = anchor_latent.shape
+) -> torch.Tensor | None:
+    _, _, height, width = anchor_latent.shape
     x0, y0, x1, y1 = bbox
-    band_w = max(0, min(int(anchor_falloff_px), x1 - x0))
-    band_h = max(0, min(int(anchor_falloff_px), y1 - y0))
     if side == "left":
-        outer_w = min(int(anchor_width_px), x0)
-        if outer_w <= 0 or band_w <= 0:
-            return None, None
-        strip = anchor_latent[:, :, y0:y1, x0 - outer_w : x0]
-        profile = _reduce_strip(strip, side, reduce)
-        target = torch.zeros(batch, channels, height, width, device=anchor_latent.device, dtype=anchor_latent.dtype)
-        target[:, :, y0:y1, x0 : x0 + band_w] = profile.expand(-1, -1, -1, band_w)
-        return target, profile
-    if side == "right":
-        outer_w = min(int(anchor_width_px), width - x1)
-        if outer_w <= 0 or band_w <= 0:
-            return None, None
-        strip = anchor_latent[:, :, y0:y1, x1 : x1 + outer_w]
-        profile = _reduce_strip(strip, side, reduce)
-        target = torch.zeros(batch, channels, height, width, device=anchor_latent.device, dtype=anchor_latent.dtype)
-        target[:, :, y0:y1, x1 - band_w : x1] = profile.expand(-1, -1, -1, band_w)
-        return target, profile
-    if side == "top":
-        outer_h = min(int(anchor_width_px), y0)
-        if outer_h <= 0 or band_h <= 0:
-            return None, None
-        strip = anchor_latent[:, :, y0 - outer_h : y0, x0:x1]
-        profile = _reduce_strip(strip, side, reduce)
-        target = torch.zeros(batch, channels, height, width, device=anchor_latent.device, dtype=anchor_latent.dtype)
-        target[:, :, y0 : y0 + band_h, x0:x1] = profile.expand(-1, -1, band_h, -1)
-        return target, profile
-    if side == "bottom":
-        outer_h = min(int(anchor_width_px), height - y1)
-        if outer_h <= 0 or band_h <= 0:
-            return None, None
-        strip = anchor_latent[:, :, y1 : y1 + outer_h, x0:x1]
-        profile = _reduce_strip(strip, side, reduce)
-        target = torch.zeros(batch, channels, height, width, device=anchor_latent.device, dtype=anchor_latent.dtype)
-        target[:, :, y1 - band_h : y1, x0:x1] = profile.expand(-1, -1, band_h, -1)
-        return target, profile
-    raise ValueError(f"unsupported side: {side}")
+        width_px = min(int(outer_width), x0)
+        if width_px <= 0:
+            return None
+        strip = anchor_latent[:, :, y0:y1, x0 - width_px : x0]
+    elif side == "right":
+        width_px = min(int(outer_width), width - x1)
+        if width_px <= 0:
+            return None
+        strip = anchor_latent[:, :, y0:y1, x1 : x1 + width_px]
+    elif side == "top":
+        width_px = min(int(outer_width), y0)
+        if width_px <= 0:
+            return None
+        strip = anchor_latent[:, :, y0 - width_px : y0, x0:x1]
+    elif side == "bottom":
+        width_px = min(int(outer_width), height - y1)
+        if width_px <= 0:
+            return None
+        strip = anchor_latent[:, :, y1 : y1 + width_px, x0:x1]
+    else:
+        raise ValueError(f"unsupported side: {side}")
+    return _reduce_strip(strip, side, reduce)
 
 
-def prepare_seam_anchor_maps(
+def _extract_inner_profile(
+    denoised: torch.Tensor,
+    bbox: tuple[int, int, int, int],
+    side: Side,
+    sample_width: int,
+    reduce: str,
+) -> torch.Tensor | None:
+    _, _, height, width = denoised.shape
+    x0, y0, x1, y1 = bbox
+    if side == "left":
+        band = min(int(sample_width), max(x1 - x0, 0))
+        if band <= 0:
+            return None
+        strip = denoised[:, :, y0:y1, x0 : x0 + band]
+    elif side == "right":
+        band = min(int(sample_width), max(x1 - x0, 0))
+        if band <= 0:
+            return None
+        strip = denoised[:, :, y0:y1, x1 - band : x1]
+    elif side == "top":
+        band = min(int(sample_width), max(y1 - y0, 0))
+        if band <= 0:
+            return None
+        strip = denoised[:, :, y0 : y0 + band, x0:x1]
+    elif side == "bottom":
+        band = min(int(sample_width), max(y1 - y0, 0))
+        if band <= 0:
+            return None
+        strip = denoised[:, :, y1 - band : y1, x0:x1]
+    else:
+        raise ValueError(f"unsupported side: {side}")
+    return _reduce_strip(strip, side, reduce)
+
+
+def _place_profile(
+    profile: torch.Tensor,
+    bbox: tuple[int, int, int, int],
+    side: Side,
+    band_size: int,
+    full_shape: tuple[int, int, int, int],
+) -> torch.Tensor:
+    batch, channels, height, width = full_shape
+    target = torch.zeros(batch, channels, height, width, device=profile.device, dtype=profile.dtype)
+    x0, y0, x1, y1 = bbox
+    if side == "left":
+        target[:, :, y0:y1, x0 : x0 + band_size] = profile.expand(-1, -1, -1, band_size)
+    elif side == "right":
+        target[:, :, y0:y1, x1 - band_size : x1] = profile.expand(-1, -1, -1, band_size)
+    elif side == "top":
+        target[:, :, y0 : y0 + band_size, x0:x1] = profile.expand(-1, -1, band_size, -1)
+    elif side == "bottom":
+        target[:, :, y1 - band_size : y1, x0:x1] = profile.expand(-1, -1, band_size, -1)
+    else:
+        raise ValueError(f"unsupported side: {side}")
+    return target
+
+
+def prepare_seam_anchor_state(
     anchor_latent: torch.Tensor,
     mask: torch.Tensor,
     *,
@@ -106,7 +165,8 @@ def prepare_seam_anchor_maps(
     process_top: bool = True,
     process_bottom: bool = True,
     reduce: str = "mean",
-) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    profile_smooth_kernel: int = 5,
+) -> dict:
     if anchor_latent.ndim != 4:
         raise ValueError("expected anchor_latent with shape [B,C,H,W]")
     if mask.ndim == 2:
@@ -133,72 +193,88 @@ def prepare_seam_anchor_maps(
     if process_bottom and y1 < anchor_latent.shape[-2]:
         sides.append("bottom")
 
-    batch, channels, height, width = anchor_latent.shape
-    zero_target = torch.zeros(batch, channels, height, width, device=anchor_latent.device, dtype=anchor_latent.dtype)
-    zero_weight = torch.zeros(batch, 1, height, width, device=anchor_latent.device, dtype=anchor_latent.dtype)
-    if not sides or anchor_width_px <= 0 or anchor_falloff_px <= 0:
-        return zero_target, zero_weight, {"bbox": bbox, "sides": tuple(), "profiles": {}, "weights": {}}
-
-    per_side_targets: dict[Side, torch.Tensor] = {}
-    per_side_weights: dict[Side, torch.Tensor] = {}
     per_side_profiles: dict[Side, torch.Tensor] = {}
+    per_side_weights: dict[Side, torch.Tensor] = {}
+    per_side_band_sizes: dict[Side, int] = {}
+    per_side_sample_widths: dict[Side, int] = {}
+
     for side in sides:
-        target, profile = _build_side_target_map(
-            anchor_latent,
-            bbox,
-            side,
-            anchor_width_px,
-            anchor_falloff_px,
-            reduce,
-        )
-        if target is None or profile is None:
+        profile = _extract_outer_profile(anchor_latent, bbox, side, anchor_width_px, reduce)
+        if profile is None:
+            continue
+        profile = _smooth_profile(profile, side, kernel_size=profile_smooth_kernel)
+        if side in {"left", "right"}:
+            band_size = min(int(anchor_falloff_px), max(x1 - x0, 0))
+            sample_width = min(int(anchor_width_px), max(x1 - x0, 0))
+        else:
+            band_size = min(int(anchor_falloff_px), max(y1 - y0, 0))
+            sample_width = min(int(anchor_width_px), max(y1 - y0, 0))
+        if band_size <= 0 or sample_width <= 0:
             continue
         weight = build_seam_local_weight_map(
             mask,
             bbox,
             side,
-            int(anchor_falloff_px),
+            band_size,
             blend_falloff_px=0,
             power=1.0,
         )
-        support = (target.abs().mean(dim=1, keepdim=True) > 1e-8).to(anchor_latent.dtype)
-        weight = weight * support
         if float(weight.max().item()) <= 0.0:
             continue
-        per_side_targets[side] = target
-        per_side_weights[side] = weight
         per_side_profiles[side] = profile
+        per_side_weights[side] = weight
+        per_side_band_sizes[side] = int(band_size)
+        per_side_sample_widths[side] = int(sample_width)
 
-    if not per_side_targets:
-        return zero_target, zero_weight, {"bbox": bbox, "sides": tuple(), "profiles": {}, "weights": {}}
-
-    target_stack = torch.stack([per_side_targets[side] for side in per_side_targets], dim=0)
-    weight_stack = torch.stack([per_side_weights[side] for side in per_side_targets], dim=0)
-    weighted_target = (target_stack * weight_stack).sum(dim=0)
-    total_weight = weight_stack.sum(dim=0)
-    merged_target = torch.where(total_weight > 1e-8, weighted_target / total_weight.clamp_min(1e-8), zero_target)
-    merged_weight = total_weight.clamp(0.0, 1.0)
-    debug = {
+    return {
         "bbox": bbox,
-        "sides": tuple(per_side_targets.keys()),
+        "mask": mask,
+        "sides": tuple(per_side_profiles.keys()),
         "profiles": per_side_profiles,
         "weights": per_side_weights,
+        "band_sizes": per_side_band_sizes,
+        "sample_widths": per_side_sample_widths,
+        "reduce": reduce,
     }
-    return merged_target * mask, merged_weight * mask, debug
 
 
 def apply_seam_anchor_correction(
     denoised: torch.Tensor,
-    target_map: torch.Tensor,
-    weight_map: torch.Tensor,
+    anchor_state: dict,
     effective_strength: float,
 ) -> torch.Tensor:
-    target = _match_batch(target_map, denoised.shape[0]).to(device=denoised.device, dtype=denoised.dtype)
-    target = _match_channels(target, denoised.shape[1])
-    weight = _match_batch(weight_map, denoised.shape[0]).to(device=denoised.device, dtype=denoised.dtype)
-    if target.shape[-2:] != denoised.shape[-2:]:
-        target = F.interpolate(target, size=denoised.shape[-2:], mode="bilinear", align_corners=False)
-    if weight.shape[-2:] != denoised.shape[-2:]:
-        weight = F.interpolate(weight, size=denoised.shape[-2:], mode="bilinear", align_corners=False)
-    effective = weight.clamp(0.0, 1.0) * float(effective_strength)
-    return denoised + (target - denoised) * effective
+    if effective_strength <= 0.0 or not anchor_state.get("sides"):
+        return denoised
+
+    bbox = anchor_state["bbox"]
+    reduce = anchor_state["reduce"]
+    profiles = anchor_state["profiles"]
+    weights = anchor_state["weights"]
+    band_sizes = anchor_state["band_sizes"]
+    sample_widths = anchor_state["sample_widths"]
+
+    zero = torch.zeros_like(denoised)
+    weighted_sum = zero
+    total_weight = torch.zeros(denoised.shape[0], 1, denoised.shape[-2], denoised.shape[-1], device=denoised.device, dtype=denoised.dtype)
+    for side in anchor_state["sides"]:
+        anchor_profile = _match_batch(profiles[side], denoised.shape[0]).to(device=denoised.device, dtype=denoised.dtype)
+        anchor_profile = _match_channels(anchor_profile, denoised.shape[1])
+        current_profile = _extract_inner_profile(denoised, bbox, side, sample_widths[side], reduce)
+        if current_profile is None:
+            continue
+        current_profile = _match_batch(current_profile, denoised.shape[0]).to(device=denoised.device, dtype=denoised.dtype)
+        current_profile = _match_channels(current_profile, denoised.shape[1])
+        correction_profile = anchor_profile - current_profile
+        correction_map = _place_profile(correction_profile, bbox, side, band_sizes[side], denoised.shape)
+        weight = _match_batch(weights[side], denoised.shape[0]).to(device=denoised.device, dtype=denoised.dtype)
+        if weight.shape[-2:] != denoised.shape[-2:]:
+            weight = F.interpolate(weight, size=denoised.shape[-2:], mode="bilinear", align_corners=False)
+        weighted_sum = weighted_sum + correction_map * weight
+        total_weight = total_weight + weight
+
+    if float(total_weight.max().item()) <= 0.0:
+        return denoised
+    coverage = total_weight.clamp(0.0, 1.0)
+    merged = torch.where(total_weight > 1.0, weighted_sum / total_weight.clamp_min(1e-8), weighted_sum)
+    merged = torch.where(total_weight > 1.0, merged * coverage, merged)
+    return denoised + merged * float(effective_strength)
