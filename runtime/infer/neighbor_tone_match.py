@@ -5,12 +5,15 @@ import math
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from scipy.ndimage import distance_transform_edt
 
 from ..strip_ops import mask_bbox
 from .merge_bands import merge_side_deltas
+from .seam_latent_anchor import _normalize_mask_like, _parse_present_positions, SIDE_TOPOLOGY
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +602,7 @@ def apply_neighbor_tone_match(
     drift_source_rgb: torch.Tensor,
     generated_rgb: torch.Tensor,
     mask: torch.Tensor,
+    topology_mask: torch.Tensor | None = None,
     *,
     inner_width: int,
     inner_flat_top_px: int | None = None,
@@ -644,17 +648,31 @@ def apply_neighbor_tone_match(
     soft_mask = mask.clamp(0.0, 1.0)
     bbox = mask_bbox((soft_mask > 1e-3).to(dtype=image_dtype))
     x0, y0, x1, y1 = bbox
+    present_positions = _parse_present_positions(
+        topology_mask,
+        bbox,
+        reference_rgb.shape[-2:],
+        device=reference_rgb.device,
+        dtype=image_dtype,
+    )
     sides = []
-    if process_left and x0 > 0:
+    if process_left and x0 > 0 and (not present_positions or SIDE_TOPOLOGY["left"] in present_positions):
         sides.append("left")
-    if process_right and x1 < reference_rgb.shape[-1]:
+    if process_right and x1 < reference_rgb.shape[-1] and (not present_positions or SIDE_TOPOLOGY["right"] in present_positions):
         sides.append("right")
-    if process_top and y0 > 0:
+    if process_top and y0 > 0 and (not present_positions or SIDE_TOPOLOGY["top"] in present_positions):
         sides.append("top")
-    if process_bottom and y1 < reference_rgb.shape[-2]:
+    if process_bottom and y1 < reference_rgb.shape[-2] and (not present_positions or SIDE_TOPOLOGY["bottom"] in present_positions):
         sides.append("bottom")
     if not sides:
-        return generated_rgb, {"reason": "no_processable_sides", "side_deltas": {}, "weights": {}, "bbox": bbox}
+        return generated_rgb, {
+            "reason": "no_processable_sides",
+            "side_deltas": {},
+            "weights": {},
+            "bbox": bbox,
+            "present_positions": tuple(sorted(present_positions)),
+            "topology_mask": _normalize_mask_like(topology_mask, reference_rgb.shape[-2:]) if topology_mask is not None else None,
+        }
 
     # Optionally linearise before YUV conversion
     if color_space == "srgb":
@@ -702,7 +720,13 @@ def apply_neighbor_tone_match(
         }
 
     if not side_deltas:
-        return generated_rgb, {"reason": "no_valid_side_deltas", "side_deltas": {}, "weights": {}, "bbox": bbox}
+        return generated_rgb, {
+            "reason": "no_valid_side_deltas",
+            "side_deltas": {},
+            "weights": {},
+            "bbox": bbox,
+            "present_positions": tuple(sorted(present_positions)),
+        }
 
     merged_delta, weights = merge_side_deltas(
         side_deltas,
@@ -727,6 +751,7 @@ def apply_neighbor_tone_match(
     return corrected_rgb, {
         "reason": "applied",
         "bbox": bbox,
+        "present_positions": tuple(sorted(present_positions)),
         "side_deltas": side_deltas,
         "weights": weights,
         "merged_delta": merged_delta,
@@ -734,6 +759,198 @@ def apply_neighbor_tone_match(
         "lut_mode": lut_mode,
         "yuv_matrix": yuv_matrix,
         "per_side": per_side_meta,
+    }
+
+
+def _freeform_inner_weight(
+    dist_in: np.ndarray,
+    *,
+    inner_width: int,
+    flat_top_px: int,
+) -> np.ndarray:
+    band = max(int(inner_width), 1)
+    flat = min(max(int(flat_top_px), 0), band)
+    radius = np.maximum(dist_in - 1.0, 0.0).astype(np.float32)
+    if flat <= 0:
+        t = np.clip(radius / float(max(band, 1)), 0.0, 1.0)
+        return 0.5 * (1.0 + np.cos(np.pi * t))
+    fade = max(float(band - flat), 1.0)
+    t = np.clip((radius - float(flat)) / fade, 0.0, 1.0)
+    weight = np.where(radius <= float(flat), 1.0, 0.5 * (1.0 + np.cos(np.pi * t)))
+    return weight.astype(np.float32)
+
+
+def _freeform_donor_zone_mask(
+    shape: tuple[int, int],
+    bbox: tuple[int, int, int, int],
+    *,
+    process_left: bool,
+    process_right: bool,
+    process_top: bool,
+    process_bottom: bool,
+) -> np.ndarray:
+    height, width = shape
+    x0, y0, x1, y1 = bbox
+    zone = np.zeros((height, width), dtype=bool)
+    if process_left and x0 > 0:
+        zone[:, :x0] = True
+    if process_right and x1 < width:
+        zone[:, x1:] = True
+    if process_top and y0 > 0:
+        zone[:y0, :] = True
+    if process_bottom and y1 < height:
+        zone[y1:, :] = True
+    return zone
+
+
+def apply_freeform_neighbor_tone_match(
+    reference_rgb: torch.Tensor,
+    image_rgb: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    inner_width: int,
+    inner_flat_top_px: int | None = None,
+    inner_falloff_px: int | None = None,
+    process_left: bool,
+    process_right: bool,
+    process_top: bool,
+    process_bottom: bool,
+    luma_strength: float,
+    chroma_strength: float,
+    u_strength: float | None = None,
+    v_strength: float | None = None,
+    bins: int = 32,
+    correction_mode: str = "hybrid",
+    color_space: str = "srgb",
+    outer_band_px: int | None = None,
+    lut_mode: str = "3d",
+    yuv_matrix: str = "bt709",
+    delta_smoothing_sigma: float = 2.0,
+) -> tuple[torch.Tensor, dict]:
+    if reference_rgb.ndim != 4 or image_rgb.ndim != 4:
+        raise ValueError("reference_rgb and image_rgb must be BCHW")
+    if reference_rgb.shape != image_rgb.shape:
+        raise ValueError("reference_rgb and image_rgb must have the same shape")
+
+    image_dtype = reference_rgb.dtype
+    if inner_flat_top_px is None:
+        inner_flat_top_px = 0 if inner_falloff_px is None else int(inner_falloff_px)
+    u_strength = float(chroma_strength if u_strength is None else u_strength)
+    v_strength = float(chroma_strength if v_strength is None else v_strength)
+
+    mask = mask.to(dtype=image_dtype)
+    if mask.ndim == 3:
+        mask = mask.unsqueeze(1)
+    elif mask.ndim != 4:
+        raise ValueError("mask must be [B,H,W] or [B,1,H,W]")
+    if mask.shape[-2:] != reference_rgb.shape[-2:]:
+        interp_mode = "bilinear" if mask.dtype.is_floating_point else "nearest"
+        if interp_mode == "bilinear":
+            mask = F.interpolate(mask, size=reference_rgb.shape[-2:], mode=interp_mode, align_corners=False)
+        else:
+            mask = F.interpolate(mask, size=reference_rgb.shape[-2:], mode=interp_mode)
+    soft_mask = mask.clamp(0.0, 1.0)
+    bbox = mask_bbox((soft_mask > 1e-3).to(dtype=image_dtype))
+
+    if color_space == "srgb":
+        ref_yuv = _rgb_to_yuv(_srgb_to_linear(reference_rgb), matrix=yuv_matrix)
+        img_yuv = _rgb_to_yuv(_srgb_to_linear(image_rgb), matrix=yuv_matrix)
+    else:
+        ref_yuv = _rgb_to_yuv(reference_rgb, matrix=yuv_matrix)
+        img_yuv = _rgb_to_yuv(image_rgb, matrix=yuv_matrix)
+    channel_scale = ref_yuv.new_tensor([float(luma_strength), u_strength, v_strength]).view(1, 3, 1, 1)
+
+    corrected_batches: list[torch.Tensor] = []
+    debug_items: list[dict] = []
+    outer_width = int(inner_width if outer_band_px is None else outer_band_px)
+    has_allowed_side = any((process_left, process_right, process_top, process_bottom))
+
+    for idx in range(reference_rgb.shape[0]):
+        mask_np = soft_mask[idx, 0].detach().cpu().numpy().astype(np.float32)
+        mask_bool = mask_np > 1e-3
+        if not np.any(mask_bool):
+            corrected_batches.append(image_rgb[idx : idx + 1])
+            debug_items.append({"reason": "empty_mask", "bbox": bbox})
+            continue
+        if not has_allowed_side:
+            corrected_batches.append(image_rgb[idx : idx + 1])
+            debug_items.append({"reason": "no_processable_sides", "bbox": bbox})
+            continue
+
+        donor_zone = _freeform_donor_zone_mask(
+            mask_bool.shape,
+            bbox,
+            process_left=process_left,
+            process_right=process_right,
+            process_top=process_top,
+            process_bottom=process_bottom,
+        )
+        outside = ~mask_bool
+        dist_out = distance_transform_edt(outside).astype(np.float32)
+        dist_in = distance_transform_edt(mask_bool).astype(np.float32)
+        outer_band = outside & donor_zone & (dist_out > 0.0) & (dist_out <= float(max(outer_width, 1)))
+        inner_band = mask_bool & (dist_in > 0.0) & (dist_in <= float(max(int(inner_width), 1)))
+
+        if not np.any(outer_band):
+            corrected_batches.append(image_rgb[idx : idx + 1])
+            debug_items.append({"reason": "no_outer_donor_samples", "bbox": bbox})
+            continue
+        if not np.any(inner_band):
+            corrected_batches.append(image_rgb[idx : idx + 1])
+            debug_items.append({"reason": "no_inner_band", "bbox": bbox})
+            continue
+
+        ref_samples = ref_yuv[idx : idx + 1, :, outer_band].reshape(1, 3, -1)
+        img_samples = img_yuv[idx : idx + 1, :, outer_band].reshape(1, 3, -1)
+        lookup = _build_delta_lookup(
+            img_samples,
+            ref_samples,
+            bins=int(bins),
+            mode=correction_mode,
+            lut_mode=lut_mode,
+            matrix=yuv_matrix,
+        )
+        delta_full = _lookup_delta(img_yuv[idx : idx + 1], lookup) * channel_scale
+        delta_full = _gaussian_blur_band(delta_full, float(delta_smoothing_sigma))
+
+        inner_weight_np = _freeform_inner_weight(
+            dist_in,
+            inner_width=int(inner_width),
+            flat_top_px=int(inner_flat_top_px),
+        ) * inner_band.astype(np.float32)
+        inner_weight = torch.from_numpy(inner_weight_np).to(device=delta_full.device, dtype=delta_full.dtype).view(1, 1, *mask_bool.shape)
+        corrected_yuv = img_yuv[idx : idx + 1] + delta_full * inner_weight * soft_mask[idx : idx + 1]
+
+        if color_space == "srgb":
+            corrected_rgb = _linear_to_srgb(
+                _compress_to_unit_gamut(
+                    _yuv_to_rgb(corrected_yuv, matrix=yuv_matrix),
+                    corrected_yuv[:, :1].expand(-1, 3, -1, -1),
+                )
+            ).clamp(0.0, 1.0)
+        else:
+            corrected_rgb = _compress_to_unit_gamut(
+                _yuv_to_rgb(corrected_yuv, matrix=yuv_matrix),
+                corrected_yuv[:, :1].expand(-1, 3, -1, -1),
+            )
+        corrected_rgb = corrected_rgb * soft_mask[idx : idx + 1] + image_rgb[idx : idx + 1] * (1.0 - soft_mask[idx : idx + 1])
+        corrected_rgb = corrected_rgb.to(dtype=image_dtype)
+        corrected_batches.append(corrected_rgb)
+        debug_items.append(
+            {
+                "reason": "applied",
+                "bbox": bbox,
+                "outer_samples": int(outer_band.sum()),
+                "inner_pixels": int(inner_band.sum()),
+            }
+        )
+
+    corrected = torch.cat(corrected_batches, dim=0)
+    return corrected, {
+        "reason": "applied" if any(item.get("reason") == "applied" for item in debug_items) else debug_items[0]["reason"],
+        "bbox": bbox,
+        "per_sample": debug_items,
+        "soft_mask": soft_mask,
     }
 
 

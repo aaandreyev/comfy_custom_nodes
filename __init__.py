@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .nodes.freeform_neighbor_tone_match_node import FreeformNeighborToneMatchNode
 from .nodes.mask_harmonize import MaskHarmonize
 from .nodes.neighbor_tone_match_node import NeighborToneMatchNode
 from .nodes.poisson_inpaint_prefill import PoissonInpaintPrefill
@@ -11,6 +12,7 @@ from .nodes import SeamGuidedKSamplerNode
 NODE_CLASS_MAPPINGS = {
     "PoissonInpaintPrefill": PoissonInpaintPrefill,
     "MaskHarmonize": MaskHarmonize,
+    "FreeformNeighborToneMatch": FreeformNeighborToneMatchNode,
     "NeighborToneMatch": NeighborToneMatchNode,
     "SeamLatentAnchor": SeamLatentAnchorNode,
     "SeamHarmonizerV3": SeamHarmonizerV3Node,
@@ -19,6 +21,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PoissonInpaintPrefill": "Poisson Inpaint Prefill",
     "MaskHarmonize": "Mask Harmonize",
+    "FreeformNeighborToneMatch": "Freeform Neighbor Tone Match",
     "NeighborToneMatch": "Neighbor Tone Match",
     "SeamLatentAnchor": "Seam Latent Anchor",
     "SeamHarmonizerV3": "Seam Harmonizer v3",

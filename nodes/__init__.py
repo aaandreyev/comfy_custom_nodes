@@ -1,3 +1,4 @@
+from .freeform_neighbor_tone_match_node import FreeformNeighborToneMatchNode
 from .mask_harmonize import MaskHarmonize
 from .neighbor_tone_match_node import NeighborToneMatchNode
 from .poisson_inpaint_prefill import PoissonInpaintPrefill
@@ -11,6 +12,7 @@ except ModuleNotFoundError:  # Optional in bare test environments without ComfyU
 
 __all__ = [
     "MaskHarmonize",
+    "FreeformNeighborToneMatchNode",
     "NeighborToneMatchNode",
     "PoissonInpaintPrefill",
     "SeamLatentAnchorNode",
