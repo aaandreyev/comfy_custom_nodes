@@ -93,7 +93,7 @@ def build_seam_local_weight_map(
             taper_end="bottom" in active_sides,
         )
     elif side == "right":
-        d = (float(x1) - xx).clamp_min(0.0)
+        d = (float(x1 - 1) - xx).clamp_min(0.0)
         base = _build_band_alpha(d, fw, fade_start_w)
         corner = _edge_corner_taper(
             yy, y0, y1, height, cpx_h,
@@ -109,7 +109,7 @@ def build_seam_local_weight_map(
             taper_end="right" in active_sides,
         )
     elif side == "bottom":
-        d = (float(y1) - yy).clamp_min(0.0)
+        d = (float(y1 - 1) - yy).clamp_min(0.0)
         base = _build_band_alpha(d, fh, fade_start_h)
         corner = _edge_corner_taper(
             xx, x0, x1, width, cpx_w,

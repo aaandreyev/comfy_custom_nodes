@@ -388,13 +388,9 @@ def _corner_release_map(
     release = torch.ones(1, 1, bh, bw, device=device, dtype=dtype)
     frac_x = min(max(float(band_size) / max(bw, 1), 0.0), 0.95)
     frac_y = min(max(float(band_size) / max(bh, 1), 0.0), 0.95)
-    if "w" in release_sides:
+    if any(side in release_sides for side in ("w", "e")):
         release = release * ((u - frac_x) / max(1.0 - frac_x, 1e-6)).clamp(0.0, 1.0)
-    if "e" in release_sides:
-        release = release * ((u - frac_x) / max(1.0 - frac_x, 1e-6)).clamp(0.0, 1.0)
-    if "n" in release_sides:
-        release = release * ((v - frac_y) / max(1.0 - frac_y, 1e-6)).clamp(0.0, 1.0)
-    if "s" in release_sides:
+    if any(side in release_sides for side in ("n", "s")):
         release = release * ((v - frac_y) / max(1.0 - frac_y, 1e-6)).clamp(0.0, 1.0)
     return release
 
@@ -435,10 +431,7 @@ def _build_corner_wedge_weight(
             device=device,
             dtype=dtype,
         )
-        if missing_side in {"n", "s"}:
-            bias = (1.0 - v) if missing_side == "n" else (1.0 - v)
-        else:
-            bias = (1.0 - u) if missing_side == "w" else (1.0 - u)
+        bias = (1.0 - v) if missing_side in {"n", "s"} else (1.0 - u)
         inner = inner * (0.25 + 0.75 * bias)
     return _make_bbox_map(bbox, inner, (height, width)) * mask
 
@@ -755,6 +748,29 @@ def _extract_inner_band(
     raise ValueError(f"unsupported side: {side}")
 
 
+def _side_band_slices(
+    bbox: tuple[int, int, int, int],
+    side: Side,
+    band_size: int,
+) -> tuple[slice, slice]:
+    x0, y0, x1, y1 = bbox
+    if side == "left":
+        return slice(y0, y1), slice(x0, x0 + band_size)
+    if side == "right":
+        return slice(y0, y1), slice(x1 - band_size, x1)
+    if side == "top":
+        return slice(y0, y0 + band_size), slice(x0, x1)
+    if side == "bottom":
+        return slice(y1 - band_size, y1), slice(x0, x1)
+    raise ValueError(f"unsupported side: {side}")
+
+
+def _expand_profile_to_band(profile: torch.Tensor, side: Side, band_size: int) -> torch.Tensor:
+    if side in {"left", "right"}:
+        return profile.expand(-1, -1, -1, band_size)
+    return profile.expand(-1, -1, band_size, -1)
+
+
 def _place_band(
     band: torch.Tensor,
     bbox: tuple[int, int, int, int],
@@ -819,6 +835,71 @@ def prepare_seam_anchor_state(
     if anchor_latent.ndim != 4:
         raise ValueError("expected anchor_latent with shape [B,C,H,W]")
     mask = _normalize_mask_like(mask, anchor_latent.shape[-2:])
+    if anchor_latent.shape[0] > 1:
+        topology_norm = None
+        if topology_mask is not None:
+            topology_norm = _normalize_mask_like(topology_mask, anchor_latent.shape[-2:])
+
+        per_sample = []
+        union_sides: set[Side] = set()
+        union_positions: set[Position] = set()
+        generation_weights = []
+        low_freq_targets = []
+        low_freq_weights = []
+        has_low_freq_target = False
+        has_low_freq_weight = False
+        any_extra = False
+
+        for idx in range(anchor_latent.shape[0]):
+            sample_mask = mask[idx : idx + 1] if mask.shape[0] > 1 else mask[:1]
+            sample_topology = None
+            if topology_norm is not None:
+                sample_topology = topology_norm[idx : idx + 1] if topology_norm.shape[0] > 1 else topology_norm[:1]
+            sample_state = prepare_seam_anchor_state(
+                anchor_latent[idx : idx + 1],
+                sample_mask,
+                topology_mask=sample_topology,
+                anchor_width_px=anchor_width_px,
+                anchor_falloff_px=anchor_falloff_px,
+                process_left=process_left,
+                process_right=process_right,
+                process_top=process_top,
+                process_bottom=process_bottom,
+                reduce=reduce,
+                profile_smooth_kernel=profile_smooth_kernel,
+                safety_ring_px=safety_ring_px,
+                low_freq_anchor_decay_px=low_freq_anchor_decay_px,
+            )
+            per_sample.append(sample_state)
+            union_sides.update(sample_state["sides"])
+            union_positions.update(sample_state.get("present_positions", ()))
+            any_extra = any_extra or bool(sample_state.get("extra_contributions"))
+            generation_weights.append(sample_state["generation_weight"])
+
+            low_freq_target = sample_state.get("low_freq_target")
+            if low_freq_target is None:
+                low_freq_targets.append(torch.zeros_like(anchor_latent[idx : idx + 1]))
+            else:
+                low_freq_targets.append(low_freq_target)
+                has_low_freq_target = True
+
+            low_freq_weight = sample_state.get("low_freq_weight")
+            if low_freq_weight is None:
+                low_freq_weights.append(torch.zeros_like(sample_mask))
+            else:
+                low_freq_weights.append(low_freq_weight)
+                has_low_freq_weight = True
+
+        return {
+            "per_sample": per_sample,
+            "generation_weight": torch.cat(generation_weights, dim=0),
+            "low_freq_target": torch.cat(low_freq_targets, dim=0) if has_low_freq_target else None,
+            "low_freq_weight": torch.cat(low_freq_weights, dim=0) if has_low_freq_weight else None,
+            "sides": tuple(sorted(union_sides)),
+            "present_positions": tuple(sorted(union_positions)),
+            "extra_contributions": [{}] if any_extra else [],
+            "reduce": reduce,
+        }
     bbox = mask_bbox(mask)
     x0, y0, x1, y1 = bbox
     present_positions = _parse_present_positions(
@@ -938,6 +1019,20 @@ def apply_seam_anchor_correction(
     *,
     low_freq_strength: float = 0.0,
 ) -> torch.Tensor:
+    if "per_sample" in anchor_state:
+        return torch.cat(
+            [
+                apply_seam_anchor_correction(
+                    denoised[idx : idx + 1],
+                    sample_state,
+                    effective_strength,
+                    low_freq_strength=low_freq_strength,
+                )
+                for idx, sample_state in enumerate(anchor_state["per_sample"])
+            ],
+            dim=0,
+        )
+
     if (effective_strength <= 0.0 and low_freq_strength <= 0.0) or (
         not anchor_state.get("sides")
         and not anchor_state.get("extra_contributions")
@@ -965,12 +1060,15 @@ def apply_seam_anchor_correction(
         current_profile = _match_batch(current_profile, denoised.shape[0]).to(device=denoised.device, dtype=denoised.dtype)
         current_profile = _match_channels(current_profile, denoised.shape[1])
         correction_profile = anchor_profile - current_profile
-        correction_map = _place_profile(correction_profile, bbox, side, band_sizes[side], denoised.shape)
         weight = _match_batch(weights[side], denoised.shape[0]).to(device=denoised.device, dtype=denoised.dtype)
+        ys, xs = _side_band_slices(bbox, side, band_sizes[side])
+        weight_local = weight[:, :, ys, xs]
         if weight.shape[-2:] != denoised.shape[-2:]:
             weight = F.interpolate(weight, size=denoised.shape[-2:], mode="bilinear", align_corners=False)
-        weighted_sum = weighted_sum + correction_map * weight
-        total_weight = total_weight + weight
+            weight_local = weight[:, :, ys, xs]
+        correction_band = _expand_profile_to_band(correction_profile, side, band_sizes[side])
+        weighted_sum[:, :, ys, xs] = weighted_sum[:, :, ys, xs] + correction_band * weight_local
+        total_weight[:, :, ys, xs] = total_weight[:, :, ys, xs] + weight_local
 
     if float(total_weight.max().item()) <= 0.0:
         corrected = denoised
@@ -1023,7 +1121,26 @@ def apply_seam_latent_guidance(
     boundary_only: bool = False,
     variance_limit: float = 2.0,
     low_freq_strength: float = 0.0,
+    match_contribution_variance: bool = False,
 ) -> torch.Tensor:
+    if "per_sample" in anchor_state:
+        return torch.cat(
+            [
+                apply_seam_latent_guidance(
+                    x[idx : idx + 1],
+                    sample_state,
+                    effective_strength,
+                    mode=mode,
+                    boundary_only=boundary_only,
+                    variance_limit=variance_limit,
+                    low_freq_strength=low_freq_strength,
+                    match_contribution_variance=match_contribution_variance,
+                )
+                for idx, sample_state in enumerate(anchor_state["per_sample"])
+            ],
+            dim=0,
+        )
+
     if (effective_strength <= 0.0 and low_freq_strength <= 0.0) or (
         not anchor_state.get("sides")
         and not anchor_state.get("extra_contributions")
@@ -1054,6 +1171,8 @@ def apply_seam_latent_guidance(
             continue
         current_profile = _match_batch(current_profile, x.shape[0]).to(device=x.device, dtype=x.dtype)
         current_profile = _match_channels(current_profile, x.shape[1])
+        ys, xs = _side_band_slices(bbox, side, band_sizes[side])
+        weight_local = weight[:, :, ys, xs]
         if mode == "matched_noise":
             inner_band = _extract_inner_band(x, bbox, side, band_sizes[side])
             if inner_band is None:
@@ -1074,15 +1193,15 @@ def apply_seam_latent_guidance(
                 mean_exp = anchor_profile.expand(-1, -1, band_sizes[side], -1)
                 cur_mean_exp = current_profile.expand(-1, -1, band_sizes[side], -1)
                 scale_exp = scale.expand(-1, -1, band_sizes[side], -1)
-            matched_band = (inner_band - cur_mean_exp) * scale_exp + mean_exp
-            delta_map = _place_band(matched_band - inner_band, bbox, side, x.shape)
+            delta_band = (inner_band - cur_mean_exp) * scale_exp + mean_exp - inner_band
         else:
             correction_profile = anchor_profile - current_profile
-            delta_map = _place_profile(correction_profile, bbox, side, band_sizes[side], x.shape)
+            delta_band = _expand_profile_to_band(correction_profile, side, band_sizes[side])
         if weight.shape[-2:] != x.shape[-2:]:
             weight = F.interpolate(weight, size=x.shape[-2:], mode="bilinear", align_corners=False)
-        weighted_sum = weighted_sum + delta_map * weight
-        total_weight = total_weight + weight
+            weight_local = weight[:, :, ys, xs]
+        weighted_sum[:, :, ys, xs] = weighted_sum[:, :, ys, xs] + delta_band * weight_local
+        total_weight[:, :, ys, xs] = total_weight[:, :, ys, xs] + weight_local
 
     if float(total_weight.max().item()) <= 0.0:
         guided = x
@@ -1100,7 +1219,18 @@ def apply_seam_latent_guidance(
                 weight = weight.clamp(0.0, 1.0).pow(2.0)
             target_mean = _match_batch(contribution["mean"], guided.shape[0]).to(device=guided.device, dtype=guided.dtype)
             target_mean = _match_channels(target_mean, guided.shape[1]).expand_as(guided)
-            weighted_sum = weighted_sum + (target_mean - guided) * weight
+            if match_contribution_variance and mode == "matched_noise" and contribution.get("std") is not None:
+                target_std = _match_batch(contribution["std"], guided.shape[0]).to(device=guided.device, dtype=guided.dtype)
+                target_std = _match_channels(target_std, guided.shape[1]).expand_as(guided)
+                weight_sum = weight.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+                current_mean = (guided * weight).sum(dim=(-2, -1), keepdim=True) / weight_sum
+                current_var = (((guided - current_mean) ** 2) * weight).sum(dim=(-2, -1), keepdim=True) / weight_sum
+                current_std = current_var.clamp_min(1e-8).sqrt()
+                scale = (target_std / current_std.clamp_min(1e-4)).clamp(1.0 / variance_limit, variance_limit)
+                matched = (guided - current_mean) * scale + target_mean
+                weighted_sum = weighted_sum + (matched - guided) * weight
+            else:
+                weighted_sum = weighted_sum + (target_mean - guided) * weight
             total_weight = total_weight + weight
         if float(total_weight.max().item()) > 0.0:
             coverage = total_weight.clamp(0.0, 1.0)
