@@ -99,13 +99,11 @@ def apply_corrector_to_full_frame(
         debug[key] = model_out[key].detach().cpu()
 
     side_deltas: dict[str, torch.Tensor] = {}
-    side_confidences: dict[str, torch.Tensor] = {}
     for index, side in enumerate(side_order):
         delta_inner = inner_delta[index : index + 1]
         confidence_inner = inner_confidence[index : index + 1]
         meta = outputs[side]["meta"]
         side_deltas[side] = _place_inner_map(delta_inner.to(image.device), image, bbox, side, inner_width, meta)
-        side_confidences[side] = _place_inner_map(confidence_inner.to(image.device), image, bbox, side, inner_width, meta)
         debug["per_side"][side] = {
             "edge_padded_pixels": outputs[side]["meta"]["edge_padded_pixels"],
             "confidence_mean": float(confidence_inner.mean().item()),
@@ -115,7 +113,6 @@ def apply_corrector_to_full_frame(
     merged, weights = merge_side_deltas(
         side_deltas,
         mask,
-        side_confidences=side_confidences,
         bbox=bbox,
         inner_width=inner_width,
         blend_falloff_px=blend_falloff_px,
@@ -124,6 +121,5 @@ def apply_corrector_to_full_frame(
     corrected = corrected * mask + image * (1.0 - mask)
     debug["weights"] = weights
     debug["side_deltas"] = side_deltas
-    debug["side_confidences"] = side_confidences
     debug["merged_delta"] = merged
     return corrected, debug

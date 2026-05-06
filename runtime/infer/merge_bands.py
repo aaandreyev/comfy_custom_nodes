@@ -29,12 +29,14 @@ def _edge_corner_taper(
     end: int,
     extent: int,
     corner_px: float,
+    taper_start: bool,
+    taper_end: bool,
 ) -> torch.Tensor:
     top = torch.ones_like(pos)
     bottom = torch.ones_like(pos)
-    if start > 0 and corner_px > 0:
+    if taper_start and start > 0 and corner_px > 0:
         top = _hann_taper_from_t(((pos - float(start)) / corner_px).clamp(0.0, 1.0))
-    if end < extent and corner_px > 0:
+    if taper_end and end < extent and corner_px > 0:
         bottom = _hann_taper_from_t(((float(end) - pos) / corner_px).clamp(0.0, 1.0))
     return torch.minimum(top, bottom).clamp(0.0, 1.0)
 
@@ -44,9 +46,11 @@ def build_seam_local_weight_map(
     bbox: tuple[int, int, int, int],
     side: str,
     inner_width: int,
+    flat_top_px: int | None = None,
     blend_falloff_px: int | None = None,
     power: float = 1.5,
     corner_px: float | None = None,
+    active_sides: set[str] | None = None,
 ) -> torch.Tensor:
     _, _, height, width = mask.shape
     x0, y0, x1, y1 = [int(x) for x in bbox]
@@ -55,14 +59,16 @@ def build_seam_local_weight_map(
     xx = torch.arange(width, device=device, dtype=dtype).view(1, 1, 1, width)
     bw = max(x1 - x0, 1)
     bh = max(y1 - y0, 1)
-    if blend_falloff_px is None:
+    if flat_top_px is None:
+        flat_top_px = blend_falloff_px
+    if flat_top_px is None:
         fw = float(max(1, min(int(inner_width), bw)))
         fh = float(max(1, min(int(inner_width), bh)))
         fade_start_w = 0.0
         fade_start_h = 0.0
     else:
-        fw = float(max(0, min(int(blend_falloff_px), bw)))
-        fh = float(max(0, min(int(blend_falloff_px), bh)))
+        fw = float(max(0, min(int(flat_top_px), bw)))
+        fh = float(max(0, min(int(flat_top_px), bh)))
         band_w = float(max(1, min(int(inner_width), bw)))
         band_h = float(max(1, min(int(inner_width), bh)))
         fade_start_w = fw
@@ -76,23 +82,40 @@ def build_seam_local_weight_map(
     else:
         cpx_h = float(max(0.0, corner_px))
         cpx_w = float(max(0.0, corner_px))
+    active_sides = {"left", "right", "top", "bottom"} if active_sides is None else set(active_sides)
 
     if side == "left":
         d = (xx - float(x0)).clamp_min(0.0)
         base = _build_band_alpha(d, fw, fade_start_w)
-        corner = _edge_corner_taper(yy, y0, y1, height, cpx_h)
+        corner = _edge_corner_taper(
+            yy, y0, y1, height, cpx_h,
+            taper_start="top" in active_sides,
+            taper_end="bottom" in active_sides,
+        )
     elif side == "right":
         d = (float(x1) - xx).clamp_min(0.0)
         base = _build_band_alpha(d, fw, fade_start_w)
-        corner = _edge_corner_taper(yy, y0, y1, height, cpx_h)
+        corner = _edge_corner_taper(
+            yy, y0, y1, height, cpx_h,
+            taper_start="top" in active_sides,
+            taper_end="bottom" in active_sides,
+        )
     elif side == "top":
         d = (yy - float(y0)).clamp_min(0.0)
         base = _build_band_alpha(d, fh, fade_start_h)
-        corner = _edge_corner_taper(xx, x0, x1, width, cpx_w)
+        corner = _edge_corner_taper(
+            xx, x0, x1, width, cpx_w,
+            taper_start="left" in active_sides,
+            taper_end="right" in active_sides,
+        )
     elif side == "bottom":
         d = (float(y1) - yy).clamp_min(0.0)
         base = _build_band_alpha(d, fh, fade_start_h)
-        corner = _edge_corner_taper(xx, x0, x1, width, cpx_w)
+        corner = _edge_corner_taper(
+            xx, x0, x1, width, cpx_w,
+            taper_start="left" in active_sides,
+            taper_end="right" in active_sides,
+        )
     else:
         raise ValueError(f"unsupported side: {side}")
     if power != 1.0:
@@ -106,8 +129,10 @@ def merge_side_deltas(
     *,
     bbox: tuple[int, int, int, int] | None = None,
     inner_width: int | None = None,
+    flat_top_px: int | None = None,
     blend_falloff_px: int | None = None,
     corner_px: float | None = None,
+    active_sides: set[str] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if not side_deltas:
         zeros = torch.zeros(mask.shape[0], 3, mask.shape[-2], mask.shape[-1], device=mask.device, dtype=mask.dtype)
@@ -121,8 +146,10 @@ def merge_side_deltas(
         if use_seam:
             weight = build_seam_local_weight_map(
                 mask, bbox, side, int(inner_width),
+                flat_top_px=flat_top_px,
                 blend_falloff_px=blend_falloff_px,
                 corner_px=corner_px,
+                active_sides=active_sides,
             ) * support
         else:
             weight = mask * support

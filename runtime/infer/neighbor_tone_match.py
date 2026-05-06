@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -22,24 +23,34 @@ def _srgb_to_linear(x: torch.Tensor) -> torch.Tensor:
 
 
 def _linear_to_srgb(x: torch.Tensor) -> torch.Tensor:
-    x = x.clamp(0.0, 1.0)
     safe = x.clamp_min(0.0031308)
     return torch.where(x <= 0.0031308, x * 12.92, 1.055 * safe ** (1.0 / 2.4) - 0.055)
 
 
-def _rgb_to_yuv(rgb: torch.Tensor) -> torch.Tensor:
+def _yuv_coefficients(matrix: str) -> tuple[tuple[float, float, float], float, float]:
+    key = str(matrix).lower()
+    if key == "bt601":
+        return (0.299, 0.587, 0.114), 0.436, 0.615
+    if key == "bt709":
+        return (0.2126, 0.7152, 0.0722), 0.436, 0.615
+    raise ValueError(f"unsupported yuv_matrix: {matrix}")
+
+
+def _rgb_to_yuv(rgb: torch.Tensor, *, matrix: str = "bt709") -> torch.Tensor:
+    (kr, kg, kb), umax, vmax = _yuv_coefficients(matrix)
     r, g, b = rgb[:, 0:1], rgb[:, 1:2], rgb[:, 2:3]
-    y = 0.299 * r + 0.587 * g + 0.114 * b
-    u = -0.14713 * r - 0.28886 * g + 0.436 * b
-    v = 0.615 * r - 0.51499 * g - 0.10001 * b
+    y = kr * r + kg * g + kb * b
+    u = umax * (b - y) / max(1.0 - kb, 1e-8)
+    v = vmax * (r - y) / max(1.0 - kr, 1e-8)
     return torch.cat([y, u, v], dim=1)
 
 
-def _yuv_to_rgb(yuv: torch.Tensor) -> torch.Tensor:
+def _yuv_to_rgb(yuv: torch.Tensor, *, matrix: str = "bt709") -> torch.Tensor:
+    (kr, kg, kb), umax, vmax = _yuv_coefficients(matrix)
     y, u, v = yuv[:, 0:1], yuv[:, 1:2], yuv[:, 2:3]
-    r = y + 1.13983 * v
-    g = y - 0.39465 * u - 0.58060 * v
-    b = y + 2.03211 * u
+    r = y + v * ((1.0 - kr) / vmax)
+    b = y + u * ((1.0 - kb) / umax)
+    g = (y - kr * r - kb * b) / max(kg, 1e-8)
     return torch.cat([r, g, b], dim=1)
 
 
@@ -47,62 +58,113 @@ def _yuv_to_rgb(yuv: torch.Tensor) -> torch.Tensor:
 # YUV quantisation
 # ---------------------------------------------------------------------------
 
-def _normalize_yuv_for_lookup(yuv: torch.Tensor) -> torch.Tensor:
+def _normalize_yuv_for_lookup(yuv: torch.Tensor, *, matrix: str = "bt709") -> torch.Tensor:
+    _, umax, vmax = _yuv_coefficients(matrix)
     out = yuv.clone()
     out[:, 0:1] = out[:, 0:1].clamp(0.0, 1.0)
-    out[:, 1:2] = ((out[:, 1:2] + 0.436) / 0.872).clamp(0.0, 1.0)
-    out[:, 2:3] = ((out[:, 2:3] + 0.615) / 1.23).clamp(0.0, 1.0)
+    out[:, 1:2] = ((out[:, 1:2] + umax) / (2.0 * umax)).clamp(0.0, 1.0)
+    out[:, 2:3] = ((out[:, 2:3] + vmax) / (2.0 * vmax)).clamp(0.0, 1.0)
     return out
 
 
-def _quantize_yuv(yuv: torch.Tensor, bins: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _quantize_yuv(yuv: torch.Tensor, bins: int, *, matrix: str = "bt709") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bins = max(int(bins), 2)
-    norm = _normalize_yuv_for_lookup(yuv)
+    norm = _normalize_yuv_for_lookup(yuv, matrix=matrix)
     q = (norm * float(bins - 1)).round().long().clamp(0, bins - 1)
     return q[:, 0], q[:, 1], q[:, 2]
+
+
+def _safe_ratio(
+    numer: torch.Tensor,
+    denom: torch.Tensor,
+    *,
+    eps: float = 1e-4,
+    min_ratio: float = 0.5,
+    max_ratio: float = 2.0,
+    signed: bool = False,
+) -> torch.Tensor:
+    if signed:
+        safe_denom = denom.sign() * denom.abs().clamp_min(eps)
+        ratio = numer / safe_denom
+        ratio = ratio.clamp(-max_ratio, max_ratio)
+    else:
+        ratio = numer / denom.clamp_min(eps)
+        ratio = ratio.clamp(min_ratio, max_ratio)
+    near_zero = numer.abs() < eps
+    if signed:
+        near_zero = near_zero & (denom.abs() < eps)
+    else:
+        near_zero = near_zero & (denom < eps)
+    return torch.where(near_zero, torch.ones_like(ratio), ratio)
 
 
 # ---------------------------------------------------------------------------
 # LUT: build, fill empty bins, lookup
 # ---------------------------------------------------------------------------
 
-def _fill_lut_nn(correction: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    """Fill empty LUT bins via iterative nearest-neighbour expansion from valid bins."""
+def _fill_lut_nn(
+    correction: torch.Tensor,
+    valid: torch.Tensor,
+    sample_counts: torch.Tensor,
+    global_correction: torch.Tensor,
+) -> torch.Tensor:
+    """Fill empty LUT bins via sample-count-weighted neighbour expansion with global fallback."""
     if valid.all():
         return correction
 
     B, nb = correction.shape[0], correction.shape[1]
-
-    # [B, 3, bins, bins, bins] — work in float32
     filled = correction.float().permute(0, 4, 1, 2, 3)
-    cur_valid = valid.float().unsqueeze(1)  # [B, 1, bins, bins, bins]
-
-    # Zero invalid bins so they don't bias the neighbour averages
-    filled = filled * cur_valid
+    weights = sample_counts.float().unsqueeze(1)
+    cur_valid = valid.unsqueeze(1)
+    global_fallback = global_correction.float().view(B, 3, 1, 1, 1)
 
     for _ in range(nb * 3):
-        if cur_valid.min() > 0.5:
+        if bool(cur_valid.all()):
             break
-        expanded = (F.max_pool3d(cur_valid, kernel_size=3, stride=1, padding=1) > 0.5).float()
-        newly = (expanded - cur_valid).clamp_min(0.0)
-        if newly.sum() < 0.5:
+        expanded = F.max_pool3d(cur_valid.float(), kernel_size=3, stride=1, padding=1) > 0.5
+        newly = expanded & (~cur_valid)
+        if not bool(newly.any()):
             break
-        # count_include_pad=True (default): div by 27 always → multiply back gives correct sum
-        ch_count = F.avg_pool3d(cur_valid, 3, 1, 1) * 27.0  # [B, 1, ...]
-        ch_sum = F.avg_pool3d(filled, 3, 1, 1) * 27.0       # [B, 3, ...]
-        new_val = ch_sum / ch_count.clamp_min(1e-8)
-        filled = torch.where((newly > 0.5).expand_as(filled), new_val, filled)
+        pooled_weights = F.avg_pool3d(weights, 3, 1, 1) * 27.0
+        pooled_sum = F.avg_pool3d(filled * weights, 3, 1, 1) * 27.0
+        neighbour_mean = pooled_sum / pooled_weights.clamp_min(1e-8)
+        fallback = torch.where(pooled_weights > 0.0, neighbour_mean, global_fallback)
+        filled = torch.where(newly.expand_as(filled), fallback, filled)
+        weights = torch.where(newly, pooled_weights.clamp_min(1.0), weights)
         cur_valid = expanded
 
-    return filled.permute(0, 2, 3, 4, 1).to(correction.dtype)  # [B, bins, bins, bins, 3]
+    remaining = ~cur_valid
+    filled = torch.where(remaining.expand_as(filled), global_fallback, filled)
+    return filled.permute(0, 2, 3, 4, 1).to(correction.dtype)
+
+
+def _global_correction_from_samples(
+    drift: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    mode: str,
+) -> torch.Tensor:
+    drift_mean = drift.mean(dim=-1)
+    ref_mean = reference.mean(dim=-1)
+    if mode == "additive":
+        return ref_mean - drift_mean
+    if mode == "multiplicative":
+        luma_ratio = _safe_ratio(ref_mean[:, :1], drift_mean[:, :1])
+        chroma_ratio = _safe_ratio(ref_mean[:, 1:], drift_mean[:, 1:], signed=True)
+        return torch.cat([luma_ratio, chroma_ratio], dim=1)
+    luma_ratio = _safe_ratio(ref_mean[:, :1], drift_mean[:, :1])
+    chroma_delta = ref_mean[:, 1:] - drift_mean[:, 1:]
+    return torch.cat([luma_ratio, chroma_delta], dim=1)
 
 
 def _build_delta_lookup(
-    drift_strip: torch.Tensor,
-    reference_strip: torch.Tensor,
+    drift_samples: torch.Tensor,
+    reference_samples: torch.Tensor,
     *,
     bins: int = 32,
     mode: str = "hybrid",
+    lut_mode: str = "3d",
+    matrix: str = "bt709",
 ) -> dict[str, torch.Tensor]:
     """
     Build a per-YUV-bin correction lookup from a pair of outer strips.
@@ -117,18 +179,74 @@ def _build_delta_lookup(
       multiplicative→ (ratio_y, ratio_u, ratio_v)
       hybrid        → (ratio_y, delta_u, delta_v)
     """
-    device = drift_strip.device
-    orig_dtype = drift_strip.dtype
-    drift = drift_strip.float()
-    reference = reference_strip.float()
+    device = drift_samples.device
+    orig_dtype = drift_samples.dtype
+    drift = drift_samples.float()
+    reference = reference_samples.float()
 
-    B, _, H, W = drift.shape
+    B, _, N = drift.shape
     bins = max(int(bins), 2)
+    global_correction = _global_correction_from_samples(drift, reference, mode=mode)
 
-    qy, qu, qv = _quantize_yuv(drift, bins)  # each [B, H, W]
+    if lut_mode == "2d_luma_curve":
+        norm = _normalize_yuv_for_lookup(drift.view(B, 3, 1, N), matrix=matrix).view(B, 3, N)
+        qy = (norm[:, 0] * float(bins - 1)).round().long().clamp(0, bins - 1)
+        qu = (norm[:, 1] * float(bins - 1)).round().long().clamp(0, bins - 1)
+        qv = (norm[:, 2] * float(bins - 1)).round().long().clamp(0, bins - 1)
 
-    # Vectorised batch+spatial flat index (no Python loop over batch)
-    b_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, H, W)
+        total_luma = B * bins
+        total_chroma = B * bins * bins
+        b_flat = torch.arange(B, device=device).view(B, 1).expand(B, N)
+        luma_idx = (b_flat * bins + qy).reshape(-1)
+        chroma_idx = (b_flat * bins * bins + qu * bins + qv).reshape(-1)
+        counts_luma = torch.zeros(total_luma, dtype=torch.float32, device=device)
+        counts_chroma = torch.zeros(total_chroma, dtype=torch.float32, device=device)
+        drift_luma_sum = torch.zeros(total_luma, 1, dtype=torch.float32, device=device)
+        ref_luma_sum = torch.zeros(total_luma, 1, dtype=torch.float32, device=device)
+        drift_chroma_sum = torch.zeros(total_chroma, 2, dtype=torch.float32, device=device)
+        ref_chroma_sum = torch.zeros(total_chroma, 2, dtype=torch.float32, device=device)
+        ones = torch.ones(B * N, dtype=torch.float32, device=device)
+        drift_luma = drift[:, :1].permute(0, 2, 1).reshape(-1, 1)
+        ref_luma = reference[:, :1].permute(0, 2, 1).reshape(-1, 1)
+        drift_chroma = drift[:, 1:].permute(0, 2, 1).reshape(-1, 2)
+        ref_chroma = reference[:, 1:].permute(0, 2, 1).reshape(-1, 2)
+        counts_luma.index_add_(0, luma_idx, ones)
+        counts_chroma.index_add_(0, chroma_idx, ones)
+        drift_luma_sum.index_add_(0, luma_idx, drift_luma)
+        ref_luma_sum.index_add_(0, luma_idx, ref_luma)
+        drift_chroma_sum.index_add_(0, chroma_idx, drift_chroma)
+        ref_chroma_sum.index_add_(0, chroma_idx, ref_chroma)
+        counts_luma = counts_luma.view(B, bins)
+        counts_chroma = counts_chroma.view(B, bins, bins)
+        drift_luma_mean = drift_luma_sum.view(B, bins, 1) / counts_luma.unsqueeze(-1).clamp_min(1e-8)
+        ref_luma_mean = ref_luma_sum.view(B, bins, 1) / counts_luma.unsqueeze(-1).clamp_min(1e-8)
+        drift_chroma_mean = drift_chroma_sum.view(B, bins, bins, 2) / counts_chroma.unsqueeze(-1).clamp_min(1e-8)
+        ref_chroma_mean = ref_chroma_sum.view(B, bins, bins, 2) / counts_chroma.unsqueeze(-1).clamp_min(1e-8)
+        valid_luma = counts_luma > 0
+        valid_chroma = counts_chroma > 0
+        luma_curve = _safe_ratio(ref_luma_mean, drift_luma_mean) if mode != "additive" else (ref_luma_mean - drift_luma_mean)
+        chroma_lookup = ref_chroma_mean - drift_chroma_mean if mode != "multiplicative" else _safe_ratio(ref_chroma_mean, drift_chroma_mean, signed=True)
+        luma_identity = torch.ones_like(luma_curve) if mode != "additive" else torch.zeros_like(luma_curve)
+        chroma_identity = torch.zeros_like(chroma_lookup) if mode != "multiplicative" else torch.ones_like(chroma_lookup)
+        luma_curve = torch.where(valid_luma.unsqueeze(-1), luma_curve, luma_identity)
+        chroma_lookup = torch.where(valid_chroma.unsqueeze(-1), chroma_lookup, chroma_identity)
+        luma_curve = _fill_curve_1d(luma_curve, valid_luma, counts_luma, global_correction[:, :1]).to(orig_dtype)
+        chroma_lookup = _fill_grid_2d(chroma_lookup, valid_chroma, counts_chroma, global_correction[:, 1:]).to(orig_dtype)
+        return {
+            "lut_mode": lut_mode,
+            "luma_curve": luma_curve,
+            "chroma_lookup": chroma_lookup,
+            "bins": torch.tensor(bins, device=device),
+            "mode": mode,
+            "matrix": matrix,
+            "global_correction": global_correction.to(orig_dtype),
+        }
+
+    norm = _normalize_yuv_for_lookup(drift.view(B, 3, 1, N), matrix=matrix).view(B, 3, N)
+    qy = (norm[:, 0] * float(bins - 1)).round().long().clamp(0, bins - 1)
+    qu = (norm[:, 1] * float(bins - 1)).round().long().clamp(0, bins - 1)
+    qv = (norm[:, 2] * float(bins - 1)).round().long().clamp(0, bins - 1)
+    b_idx = torch.arange(B, device=device).view(B, 1).expand(B, N)
     flat_idx = (b_idx * bins ** 3 + qy * bins ** 2 + qu * bins + qv).reshape(-1)
 
     total = B * bins ** 3
@@ -136,9 +254,9 @@ def _build_delta_lookup(
     drift_sum = torch.zeros(total, 3, dtype=torch.float32, device=device)
     ref_sum = torch.zeros(total, 3, dtype=torch.float32, device=device)
 
-    ones = torch.ones(flat_idx.shape[0], dtype=torch.float32, device=device)
-    drift_flat = drift.permute(0, 2, 3, 1).reshape(-1, 3)
-    ref_flat = reference.permute(0, 2, 3, 1).reshape(-1, 3)
+    ones = torch.ones(B * N, dtype=torch.float32, device=device)
+    drift_flat = drift.permute(0, 2, 1).reshape(-1, 3)
+    ref_flat = reference.permute(0, 2, 1).reshape(-1, 3)
 
     counts.index_add_(0, flat_idx, ones)
     drift_sum.index_add_(0, flat_idx, drift_flat)
@@ -157,10 +275,12 @@ def _build_delta_lookup(
         correction = ref_mean - drift_mean
         identity = torch.zeros_like(correction)
     elif mode == "multiplicative":
-        correction = ref_mean / drift_mean.clamp_min(1e-6)
+        luma_ratio = _safe_ratio(ref_mean[..., :1], drift_mean[..., :1])
+        chroma_ratio = _safe_ratio(ref_mean[..., 1:], drift_mean[..., 1:], signed=True)
+        correction = torch.cat([luma_ratio, chroma_ratio], dim=-1)
         identity = torch.ones_like(correction)
     else:  # hybrid
-        luma_ratio = ref_mean[..., :1] / drift_mean[..., :1].clamp_min(1e-6)
+        luma_ratio = _safe_ratio(ref_mean[..., :1], drift_mean[..., :1])
         chroma_delta = ref_mean[..., 1:] - drift_mean[..., 1:]
         correction = torch.cat([luma_ratio, chroma_delta], dim=-1)
         identity = torch.zeros_like(correction)
@@ -170,13 +290,78 @@ def _build_delta_lookup(
     correction = torch.where(valid.unsqueeze(-1), correction, identity)
 
     # Nearest-neighbour fill: propagate valid-bin values into empty neighbours
-    correction = _fill_lut_nn(correction, valid)
+    correction = _fill_lut_nn(correction, valid, counts, global_correction)
 
     return {
         "correction": correction.to(orig_dtype),
         "bins": torch.tensor(bins, device=device),
         "mode": mode,
+        "lut_mode": lut_mode,
+        "matrix": matrix,
+        "global_correction": global_correction.to(orig_dtype),
     }
+
+
+def _fill_curve_1d(
+    values: torch.Tensor,
+    valid: torch.Tensor,
+    sample_counts: torch.Tensor,
+    global_value: torch.Tensor,
+) -> torch.Tensor:
+    if bool(valid.all()):
+        return values
+    B, bins = valid.shape
+    filled = values.float().permute(0, 2, 1)
+    weights = sample_counts.float().unsqueeze(1)
+    cur_valid = valid.unsqueeze(1)
+    global_fallback = global_value.float().view(B, values.shape[-1], 1)
+    for _ in range(bins):
+        if bool(cur_valid.all()):
+            break
+        expanded = F.max_pool1d(cur_valid.float(), kernel_size=3, stride=1, padding=1) > 0.5
+        newly = expanded & (~cur_valid)
+        if not bool(newly.any()):
+            break
+        pooled_weights = F.avg_pool1d(weights, 3, 1, 1) * 3.0
+        pooled_sum = F.avg_pool1d(filled * weights, 3, 1, 1) * 3.0
+        neighbour_mean = pooled_sum / pooled_weights.clamp_min(1e-8)
+        fallback = torch.where(pooled_weights > 0.0, neighbour_mean, global_fallback)
+        filled = torch.where(newly.expand_as(filled), fallback, filled)
+        weights = torch.where(newly, pooled_weights.clamp_min(1.0), weights)
+        cur_valid = expanded
+    filled = torch.where((~cur_valid).expand_as(filled), global_fallback, filled)
+    return filled.permute(0, 2, 1).to(values.dtype)
+
+
+def _fill_grid_2d(
+    values: torch.Tensor,
+    valid: torch.Tensor,
+    sample_counts: torch.Tensor,
+    global_value: torch.Tensor,
+) -> torch.Tensor:
+    if bool(valid.all()):
+        return values
+    B, bins, _ = valid.shape
+    filled = values.float().permute(0, 3, 1, 2)
+    weights = sample_counts.float().unsqueeze(1)
+    cur_valid = valid.unsqueeze(1)
+    global_fallback = global_value.float().view(B, values.shape[-1], 1, 1)
+    for _ in range(bins * 2):
+        if bool(cur_valid.all()):
+            break
+        expanded = F.max_pool2d(cur_valid.float(), kernel_size=3, stride=1, padding=1) > 0.5
+        newly = expanded & (~cur_valid)
+        if not bool(newly.any()):
+            break
+        pooled_weights = F.avg_pool2d(weights, 3, 1, 1) * 9.0
+        pooled_sum = F.avg_pool2d(filled * weights, 3, 1, 1) * 9.0
+        neighbour_mean = pooled_sum / pooled_weights.clamp_min(1e-8)
+        fallback = torch.where(pooled_weights > 0.0, neighbour_mean, global_fallback)
+        filled = torch.where(newly.expand_as(filled), fallback, filled)
+        weights = torch.where(newly, pooled_weights.clamp_min(1.0), weights)
+        cur_valid = expanded
+    filled = torch.where((~cur_valid).expand_as(filled), global_fallback, filled)
+    return filled.permute(0, 2, 3, 1).to(values.dtype)
 
 
 def _lookup_delta(
@@ -189,14 +374,67 @@ def _lookup_delta(
     """
     bins = int(lookup["bins"].item())
     mode = lookup["mode"]
-    correction = lookup["correction"]  # [B, bins, bins, bins, 3]
-
-    qy, qu, qv = _quantize_yuv(generated_band, bins)
+    lut_mode = lookup.get("lut_mode", "3d")
+    matrix = str(lookup.get("matrix", "bt709"))
+    norm = _normalize_yuv_for_lookup(generated_band, matrix=matrix) * float(bins - 1)
+    lo = norm.floor().long().clamp(0, bins - 1)
+    hi = (lo + 1).clamp(0, bins - 1)
+    frac = (norm - lo.float()).clamp(0.0, 1.0)
+    y0, u0, v0 = lo[:, 0], lo[:, 1], lo[:, 2]
+    y1, u1, v1 = hi[:, 0], hi[:, 1], hi[:, 2]
+    fy, fu, fv = frac[:, 0:1], frac[:, 1:2], frac[:, 2:3]
     B = generated_band.shape[0]
-
     b_idx = torch.arange(B, device=generated_band.device).view(B, 1, 1)
-    looked_up = correction[b_idx, qy, qu, qv]  # [B, H, W, 3]
-    looked_up = looked_up.permute(0, 3, 1, 2)  # [B, 3, H, W]
+
+    if lut_mode == "2d_luma_curve":
+        luma_curve = lookup["luma_curve"]
+        chroma_lookup = lookup["chroma_lookup"]
+
+        def gather_luma(yy: torch.Tensor) -> torch.Tensor:
+            return luma_curve[b_idx, yy].permute(0, 3, 1, 2)
+
+        def gather_chroma(uu: torch.Tensor, vv: torch.Tensor) -> torch.Tensor:
+            return chroma_lookup[b_idx, uu, vv].permute(0, 3, 1, 2)
+
+        looked_luma = gather_luma(y0) * (1.0 - fy) + gather_luma(y1) * fy
+        c00 = gather_chroma(u0, v0)
+        c01 = gather_chroma(u0, v1)
+        c10 = gather_chroma(u1, v0)
+        c11 = gather_chroma(u1, v1)
+        looked_chroma = (
+            c00 * ((1.0 - fu) * (1.0 - fv)) +
+            c01 * ((1.0 - fu) * fv) +
+            c10 * (fu * (1.0 - fv)) +
+            c11 * (fu * fv)
+        )
+        looked_up = torch.cat([looked_luma, looked_chroma], dim=1)
+    else:
+        correction = lookup["correction"]
+
+        def gather(yy: torch.Tensor, uu: torch.Tensor, vv: torch.Tensor) -> torch.Tensor:
+            return correction[b_idx, yy, uu, vv].permute(0, 3, 1, 2)
+
+        c000 = gather(y0, u0, v0)
+        c001 = gather(y0, u0, v1)
+        c010 = gather(y0, u1, v0)
+        c011 = gather(y0, u1, v1)
+        c100 = gather(y1, u0, v0)
+        c101 = gather(y1, u0, v1)
+        c110 = gather(y1, u1, v0)
+        c111 = gather(y1, u1, v1)
+        fy0 = 1.0 - fy
+        fu0 = 1.0 - fu
+        fv0 = 1.0 - fv
+        looked_up = (
+            c000 * (fy0 * fu0 * fv0) +
+            c001 * (fy0 * fu0 * fv) +
+            c010 * (fy0 * fu * fv0) +
+            c011 * (fy0 * fu * fv) +
+            c100 * (fy * fu0 * fv0) +
+            c101 * (fy * fu0 * fv) +
+            c110 * (fy * fu * fv0) +
+            c111 * (fy * fu * fv)
+        )
 
     if mode == "additive":
         return looked_up
@@ -207,6 +445,61 @@ def _lookup_delta(
         luma_delta = generated_band[:, :1] * (looked_up[:, :1] - 1.0)
         chroma_delta = looked_up[:, 1:]
         return torch.cat([luma_delta, chroma_delta], dim=1)
+
+
+def _gather_outer_samples(
+    image: torch.Tensor,
+    bbox: tuple[int, int, int, int],
+    sides: list[str],
+    band_width: int,
+) -> torch.Tensor | None:
+    strips: list[torch.Tensor] = []
+    for side in sides:
+        strip = _extract_outer_side_strip(image, bbox, side, band_width)
+        if strip is not None:
+            strips.append(strip.flatten(2))
+    if not strips:
+        return None
+    return torch.cat(strips, dim=-1)
+
+
+def _gaussian_kernel_1d(sigma: float, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    radius = max(1, int(math.ceil(sigma * 3.0)))
+    coords = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
+    kernel = torch.exp(-(coords.square()) / max(2.0 * sigma * sigma, 1e-8))
+    kernel = kernel / kernel.sum().clamp_min(1e-8)
+    return kernel.to(dtype=dtype)
+
+
+def _gaussian_blur_band(delta_band: torch.Tensor, sigma: float) -> torch.Tensor:
+    if sigma <= 0.0:
+        return delta_band
+    kernel = _gaussian_kernel_1d(sigma, delta_band.dtype, delta_band.device)
+    pad = kernel.numel() // 2
+    ky = kernel.view(1, 1, -1, 1)
+    kx = kernel.view(1, 1, 1, -1)
+    channels = delta_band.shape[1]
+    out = F.conv2d(F.pad(delta_band, (0, 0, pad, pad), mode="replicate"), ky.expand(channels, 1, -1, 1), groups=channels)
+    out = F.conv2d(F.pad(out, (pad, pad, 0, 0), mode="replicate"), kx.expand(channels, 1, 1, -1), groups=channels)
+    return out
+
+
+def _compress_to_unit_gamut(rgb: torch.Tensor, neutral: torch.Tensor) -> torch.Tensor:
+    delta = rgb - neutral
+    scale = torch.ones_like(neutral)
+    positive = delta > 1e-8
+    negative = delta < -1e-8
+    if bool(positive.any()):
+        scale = torch.minimum(
+            scale,
+            torch.where(positive, (1.0 - neutral) / delta.clamp_min(1e-8), torch.ones_like(delta)).amin(dim=1, keepdim=True),
+        )
+    if bool(negative.any()):
+        scale = torch.minimum(
+            scale,
+            torch.where(negative, neutral / (-delta).clamp_min(1e-8), torch.ones_like(delta)).amin(dim=1, keepdim=True),
+        )
+    return (neutral + delta * scale.clamp(0.0, 1.0)).clamp(0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -308,33 +601,48 @@ def apply_neighbor_tone_match(
     mask: torch.Tensor,
     *,
     inner_width: int,
-    inner_falloff_px: int,
+    inner_flat_top_px: int | None = None,
+    inner_falloff_px: int | None = None,
     process_left: bool,
     process_right: bool,
     process_top: bool,
     process_bottom: bool,
     luma_strength: float,
     chroma_strength: float,
+    u_strength: float | None = None,
+    v_strength: float | None = None,
     bins: int = 32,
     correction_mode: str = "hybrid",
-    color_space: str = "linear",
+    color_space: str = "srgb",
     corner_px: float | None = None,
+    outer_band_px: int | None = None,
+    lut_mode: str = "3d",
+    yuv_matrix: str = "bt709",
+    delta_smoothing_sigma: float = 2.0,
 ) -> tuple[torch.Tensor, dict]:
     if reference_rgb.ndim != 4 or drift_source_rgb.ndim != 4 or generated_rgb.ndim != 4:
         raise ValueError("reference_rgb, drift_source_rgb, and generated_rgb must be BCHW")
     if reference_rgb.shape != generated_rgb.shape or reference_rgb.shape != drift_source_rgb.shape:
         raise ValueError("reference_rgb, drift_source_rgb, and generated_rgb must have the same shape")
 
-    mask = mask.float()
+    image_dtype = reference_rgb.dtype
+    if inner_flat_top_px is None:
+        inner_flat_top_px = 0 if inner_falloff_px is None else int(inner_falloff_px)
+    u_strength = float(chroma_strength if u_strength is None else u_strength)
+    v_strength = float(chroma_strength if v_strength is None else v_strength)
+    mask = mask.to(dtype=image_dtype)
     if mask.ndim == 3:
         mask = mask.unsqueeze(1)
     elif mask.ndim != 4:
         raise ValueError("mask must be [B,H,W] or [B,1,H,W]")
     if mask.shape[-2:] != reference_rgb.shape[-2:]:
-        mask = F.interpolate(mask, size=reference_rgb.shape[-2:], mode="nearest")
-    mask = (mask > 0.5).float()
-
-    bbox = mask_bbox(mask)
+        interp_mode = "bilinear" if mask.dtype.is_floating_point else "nearest"
+        if interp_mode == "bilinear":
+            mask = F.interpolate(mask, size=reference_rgb.shape[-2:], mode=interp_mode, align_corners=False)
+        else:
+            mask = F.interpolate(mask, size=reference_rgb.shape[-2:], mode=interp_mode)
+    soft_mask = mask.clamp(0.0, 1.0)
+    bbox = mask_bbox((soft_mask > 1e-3).to(dtype=image_dtype))
     x0, y0, x1, y1 = bbox
     sides = []
     if process_left and x0 > 0:
@@ -358,23 +666,34 @@ def apply_neighbor_tone_match(
         drift_lin = drift_source_rgb
         gen_lin = generated_rgb
 
-    reference_yuv = _rgb_to_yuv(ref_lin)
-    drift_source_yuv = _rgb_to_yuv(drift_lin)
-    generated_yuv = _rgb_to_yuv(gen_lin)
+    reference_yuv = _rgb_to_yuv(ref_lin, matrix=yuv_matrix)
+    drift_source_yuv = _rgb_to_yuv(drift_lin, matrix=yuv_matrix)
+    generated_yuv = _rgb_to_yuv(gen_lin, matrix=yuv_matrix)
     channel_scale = reference_yuv.new_tensor(
-        [float(luma_strength), float(chroma_strength), float(chroma_strength)]
+        [float(luma_strength), u_strength, v_strength]
     ).view(1, 3, 1, 1)
 
     side_deltas: dict[str, torch.Tensor] = {}
     per_side_meta: dict[str, dict] = {}
+    outer_width = int(inner_width if outer_band_px is None else outer_band_px)
+    reference_outer_samples = _gather_outer_samples(reference_yuv, bbox, sides, outer_width)
+    drift_outer_samples = _gather_outer_samples(drift_source_yuv, bbox, sides, outer_width)
+    lookup = None
+    if reference_outer_samples is not None and drift_outer_samples is not None:
+        lookup = _build_delta_lookup(
+            drift_outer_samples,
+            reference_outer_samples,
+            bins=int(bins),
+            mode=correction_mode,
+            lut_mode=lut_mode,
+            matrix=yuv_matrix,
+        )
     for side in sides:
-        reference_outer = _extract_outer_side_strip(reference_yuv, bbox, side, int(inner_width))
-        drift_outer = _extract_outer_side_strip(drift_source_yuv, bbox, side, int(inner_width))
         generated_inner = _extract_inner_side_band(generated_yuv, bbox, side, int(inner_width))
-        if reference_outer is None or drift_outer is None or generated_inner is None:
+        if lookup is None or generated_inner is None:
             continue
-        lookup = _build_delta_lookup(drift_outer, reference_outer, bins=int(bins), mode=correction_mode)
         delta_band = _lookup_delta(generated_inner, lookup) * channel_scale
+        delta_band = _gaussian_blur_band(delta_band, float(delta_smoothing_sigma))
         placed = _place_side_delta(delta_band, bbox, side, generated_yuv.shape)
         side_deltas[side] = placed
         per_side_meta[side] = {
@@ -387,19 +706,23 @@ def apply_neighbor_tone_match(
 
     merged_delta, weights = merge_side_deltas(
         side_deltas,
-        mask,
+        soft_mask,
         bbox=bbox,
         inner_width=int(inner_width),
-        blend_falloff_px=int(inner_falloff_px),
+        flat_top_px=int(inner_flat_top_px),
         corner_px=corner_px,
+        active_sides=set(side_deltas),
     )
+    merged_delta = merged_delta.to(dtype=image_dtype)
     corrected_yuv = generated_yuv + merged_delta
-    corrected_lin = _yuv_to_rgb(corrected_yuv).clamp(0.0, 1.0)
+    corrected_lin = _compress_to_unit_gamut(_yuv_to_rgb(corrected_yuv, matrix=yuv_matrix), corrected_yuv[:, :1].expand(-1, 3, -1, -1))
 
     if color_space == "srgb":
-        corrected_rgb = _linear_to_srgb(corrected_lin)
+        corrected_rgb = _linear_to_srgb(corrected_lin).clamp(0.0, 1.0)
     else:
         corrected_rgb = corrected_lin
+    corrected_rgb = corrected_rgb * soft_mask + generated_rgb * (1.0 - soft_mask)
+    corrected_rgb = corrected_rgb.to(dtype=image_dtype)
 
     return corrected_rgb, {
         "reason": "applied",
@@ -407,6 +730,9 @@ def apply_neighbor_tone_match(
         "side_deltas": side_deltas,
         "weights": weights,
         "merged_delta": merged_delta,
+        "soft_mask": soft_mask,
+        "lut_mode": lut_mode,
+        "yuv_matrix": yuv_matrix,
         "per_side": per_side_meta,
     }
 
