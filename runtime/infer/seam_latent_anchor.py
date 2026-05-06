@@ -200,6 +200,27 @@ def _make_bbox_map(
     return out
 
 
+def _make_bbox_feature_map(
+    bbox: tuple[int, int, int, int],
+    inner_map: torch.Tensor,
+    full_shape: tuple[int, int],
+) -> torch.Tensor:
+    if inner_map.ndim != 4:
+        raise ValueError("inner_map must be BCHW")
+    height, width = full_shape
+    out = torch.zeros(
+        inner_map.shape[0],
+        inner_map.shape[1],
+        height,
+        width,
+        device=inner_map.device,
+        dtype=inner_map.dtype,
+    )
+    x0, y0, x1, y1 = bbox
+    out[:, :, y0:y1, x0:x1] = inner_map
+    return out
+
+
 def _extract_corner_patch(
     anchor_latent: torch.Tensor,
     bbox: tuple[int, int, int, int],
@@ -348,7 +369,7 @@ def _build_low_freq_target_map(
     if field_acc is None or weight_acc is None:
         return None
     inner = field_acc / weight_acc.clamp_min(1e-6)
-    return _make_bbox_map(bbox, inner, full_shape)
+    return _make_bbox_feature_map(bbox, inner, full_shape)
 
 
 def _corner_release_map(
