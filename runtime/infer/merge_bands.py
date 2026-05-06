@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 
 
 def _hann_taper_from_t(t: torch.Tensor) -> torch.Tensor:
@@ -31,11 +32,11 @@ def _edge_corner_taper(
 ) -> torch.Tensor:
     top = torch.ones_like(pos)
     bottom = torch.ones_like(pos)
-    if start > 0:
+    if start > 0 and corner_px > 0:
         top = _hann_taper_from_t(((pos - float(start)) / corner_px).clamp(0.0, 1.0))
-    if end < extent:
+    if end < extent and corner_px > 0:
         bottom = _hann_taper_from_t(((float(end) - pos) / corner_px).clamp(0.0, 1.0))
-    return torch.minimum(top, bottom).clamp_min(1e-3)
+    return torch.minimum(top, bottom).clamp(0.0, 1.0)
 
 
 def build_seam_local_weight_map(
@@ -45,6 +46,7 @@ def build_seam_local_weight_map(
     inner_width: int,
     blend_falloff_px: int | None = None,
     power: float = 1.5,
+    corner_px: float | None = None,
 ) -> torch.Tensor:
     _, _, height, width = mask.shape
     x0, y0, x1, y1 = [int(x) for x in bbox]
@@ -67,8 +69,14 @@ def build_seam_local_weight_map(
         fade_start_h = fh
         fw = band_w
         fh = band_h
-    cpx_h = float(max(12, min(32, int(inner_width) // 8)))
-    cpx_w = float(max(12, min(32, int(inner_width) // 8)))
+
+    if corner_px is None:
+        cpx_h = float(max(4, min(bh // 6, int(inner_width) // 4)))
+        cpx_w = float(max(4, min(bw // 6, int(inner_width) // 4)))
+    else:
+        cpx_h = float(max(0.0, corner_px))
+        cpx_w = float(max(0.0, corner_px))
+
     if side == "left":
         d = (xx - float(x0)).clamp_min(0.0)
         base = _build_band_alpha(d, fw, fade_start_w)
@@ -96,12 +104,11 @@ def merge_side_deltas(
     side_deltas: dict[str, torch.Tensor],
     mask: torch.Tensor,
     *,
-    side_confidences: dict[str, torch.Tensor] | None = None,
     bbox: tuple[int, int, int, int] | None = None,
     inner_width: int | None = None,
     blend_falloff_px: int | None = None,
+    corner_px: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    del side_confidences
     if not side_deltas:
         zeros = torch.zeros(mask.shape[0], 3, mask.shape[-2], mask.shape[-1], device=mask.device, dtype=mask.dtype)
         return zeros, {}
@@ -111,7 +118,14 @@ def merge_side_deltas(
     deltas = []
     for side, delta in side_deltas.items():
         support = (delta.abs().mean(dim=1, keepdim=True) > 1e-8).to(mask.dtype)
-        weight = build_seam_local_weight_map(mask, bbox, side, int(inner_width), blend_falloff_px=blend_falloff_px) * support if use_seam else mask * support
+        if use_seam:
+            weight = build_seam_local_weight_map(
+                mask, bbox, side, int(inner_width),
+                blend_falloff_px=blend_falloff_px,
+                corner_px=corner_px,
+            ) * support
+        else:
+            weight = mask * support
         weights[side] = weight
         stack.append(weight)
         deltas.append(delta)
@@ -119,8 +133,5 @@ def merge_side_deltas(
     d_stack = torch.stack(deltas, dim=0)
     weighted_sum = (w_stack * d_stack).sum(dim=0)
     total_w = w_stack.sum(dim=0)
-    coverage = total_w.clamp(0.0, 1.0)
-    normalized = weighted_sum / total_w.clamp_min(1e-8)
-    merged = torch.where(total_w > 1.0, normalized, weighted_sum)
-    merged = torch.where(total_w > 1.0, normalized * coverage, merged)
+    merged = torch.where(total_w > 1.0, weighted_sum / total_w.clamp_min(1e-8), weighted_sum)
     return merged * mask, weights

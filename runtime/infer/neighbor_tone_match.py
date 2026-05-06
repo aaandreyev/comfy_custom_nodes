@@ -12,6 +12,21 @@ from ..strip_ops import mask_bbox
 from .merge_bands import merge_side_deltas
 
 
+# ---------------------------------------------------------------------------
+# Colour space helpers
+# ---------------------------------------------------------------------------
+
+def _srgb_to_linear(x: torch.Tensor) -> torch.Tensor:
+    safe = x.clamp_min(0.04045)
+    return torch.where(x <= 0.04045, x / 12.92, ((safe + 0.055) / 1.055) ** 2.4)
+
+
+def _linear_to_srgb(x: torch.Tensor) -> torch.Tensor:
+    x = x.clamp(0.0, 1.0)
+    safe = x.clamp_min(0.0031308)
+    return torch.where(x <= 0.0031308, x * 12.92, 1.055 * safe ** (1.0 / 2.4) - 0.055)
+
+
 def _rgb_to_yuv(rgb: torch.Tensor) -> torch.Tensor:
     r, g, b = rgb[:, 0:1], rgb[:, 1:2], rgb[:, 2:3]
     y = 0.299 * r + 0.587 * g + 0.114 * b
@@ -28,30 +43,9 @@ def _yuv_to_rgb(yuv: torch.Tensor) -> torch.Tensor:
     return torch.cat([r, g, b], dim=1)
 
 
-def _lowpass_preserve_aspect(x: torch.Tensor, short_side: int) -> torch.Tensor:
-    short_side = max(int(short_side), 1)
-    height, width = x.shape[-2:]
-    current_short = min(height, width)
-    if current_short <= short_side:
-        return x
-    scale = float(short_side) / float(current_short)
-    target_h = max(1, int(round(height * scale)))
-    target_w = max(1, int(round(width * scale)))
-    down = F.interpolate(x, size=(target_h, target_w), mode="bilinear", align_corners=False)
-    return F.interpolate(down, size=(height, width), mode="bilinear", align_corners=False)
-
-
-def _resize_preserve_short_side(x: torch.Tensor, short_side: int) -> torch.Tensor:
-    short_side = max(int(short_side), 1)
-    height, width = x.shape[-2:]
-    current_short = min(height, width)
-    if current_short <= short_side:
-        return x
-    scale = float(short_side) / float(current_short)
-    target_h = max(1, int(round(height * scale)))
-    target_w = max(1, int(round(width * scale)))
-    return F.interpolate(x, size=(target_h, target_w), mode="bilinear", align_corners=False)
-
+# ---------------------------------------------------------------------------
+# YUV quantisation
+# ---------------------------------------------------------------------------
 
 def _normalize_yuv_for_lookup(yuv: torch.Tensor) -> torch.Tensor:
     out = yuv.clone()
@@ -68,37 +62,120 @@ def _quantize_yuv(yuv: torch.Tensor, bins: int) -> tuple[torch.Tensor, torch.Ten
     return q[:, 0], q[:, 1], q[:, 2]
 
 
+# ---------------------------------------------------------------------------
+# LUT: build, fill empty bins, lookup
+# ---------------------------------------------------------------------------
+
+def _fill_lut_nn(correction: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Fill empty LUT bins via iterative nearest-neighbour expansion from valid bins."""
+    if valid.all():
+        return correction
+
+    B, nb = correction.shape[0], correction.shape[1]
+
+    # [B, 3, bins, bins, bins] — work in float32
+    filled = correction.float().permute(0, 4, 1, 2, 3)
+    cur_valid = valid.float().unsqueeze(1)  # [B, 1, bins, bins, bins]
+
+    # Zero invalid bins so they don't bias the neighbour averages
+    filled = filled * cur_valid
+
+    for _ in range(nb * 3):
+        if cur_valid.min() > 0.5:
+            break
+        expanded = (F.max_pool3d(cur_valid, kernel_size=3, stride=1, padding=1) > 0.5).float()
+        newly = (expanded - cur_valid).clamp_min(0.0)
+        if newly.sum() < 0.5:
+            break
+        # count_include_pad=True (default): div by 27 always → multiply back gives correct sum
+        ch_count = F.avg_pool3d(cur_valid, 3, 1, 1) * 27.0  # [B, 1, ...]
+        ch_sum = F.avg_pool3d(filled, 3, 1, 1) * 27.0       # [B, 3, ...]
+        new_val = ch_sum / ch_count.clamp_min(1e-8)
+        filled = torch.where((newly > 0.5).expand_as(filled), new_val, filled)
+        cur_valid = expanded
+
+    return filled.permute(0, 2, 3, 4, 1).to(correction.dtype)  # [B, bins, bins, bins, 3]
+
+
 def _build_delta_lookup(
-    generated_strip: torch.Tensor,
-    original_strip: torch.Tensor,
+    drift_strip: torch.Tensor,
+    reference_strip: torch.Tensor,
     *,
-    bins: int = 24,
+    bins: int = 32,
+    mode: str = "hybrid",
 ) -> dict[str, torch.Tensor]:
-    if generated_strip.shape != original_strip.shape:
-        raise ValueError("generated_strip and original_strip must have the same shape")
-    device = generated_strip.device
-    dtype = generated_strip.dtype
-    batch = generated_strip.shape[0]
-    delta = original_strip - generated_strip
-    qy, qu, qv = _quantize_yuv(generated_strip, bins)
-    delta_sum = torch.zeros(batch, bins, bins, bins, 3, device=device, dtype=dtype)
-    counts = torch.zeros(batch, bins, bins, bins, device=device, dtype=dtype)
-    global_delta = delta.mean(dim=(-2, -1))
-    for b in range(batch):
-        ys = qy[b].reshape(-1)
-        us = qu[b].reshape(-1)
-        vs = qv[b].reshape(-1)
-        vals = delta[b].permute(1, 2, 0).reshape(-1, 3)
-        flat_idx = ys * (bins * bins) + us * bins + vs
-        delta_sum_flat = delta_sum[b].view(-1, 3)
-        counts_flat = counts[b].view(-1)
-        counts_flat.index_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=dtype))
-        delta_sum_flat.index_add_(0, flat_idx, vals)
+    """
+    Build a per-YUV-bin correction lookup from a pair of outer strips.
+
+    correction_mode:
+      "additive"      — ref_mean - drift_mean per bin (classic delta)
+      "multiplicative"— ref_mean / drift_mean per bin (ratio, handles exposure)
+      "hybrid"        — multiplicative luma + additive chroma (best default)
+
+    Stored correction per bin:
+      additive      → (delta_y, delta_u, delta_v)
+      multiplicative→ (ratio_y, ratio_u, ratio_v)
+      hybrid        → (ratio_y, delta_u, delta_v)
+    """
+    device = drift_strip.device
+    orig_dtype = drift_strip.dtype
+    drift = drift_strip.float()
+    reference = reference_strip.float()
+
+    B, _, H, W = drift.shape
+    bins = max(int(bins), 2)
+
+    qy, qu, qv = _quantize_yuv(drift, bins)  # each [B, H, W]
+
+    # Vectorised batch+spatial flat index (no Python loop over batch)
+    b_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, H, W)
+    flat_idx = (b_idx * bins ** 3 + qy * bins ** 2 + qu * bins + qv).reshape(-1)
+
+    total = B * bins ** 3
+    counts = torch.zeros(total, dtype=torch.float32, device=device)
+    drift_sum = torch.zeros(total, 3, dtype=torch.float32, device=device)
+    ref_sum = torch.zeros(total, 3, dtype=torch.float32, device=device)
+
+    ones = torch.ones(flat_idx.shape[0], dtype=torch.float32, device=device)
+    drift_flat = drift.permute(0, 2, 3, 1).reshape(-1, 3)
+    ref_flat = reference.permute(0, 2, 3, 1).reshape(-1, 3)
+
+    counts.index_add_(0, flat_idx, ones)
+    drift_sum.index_add_(0, flat_idx, drift_flat)
+    ref_sum.index_add_(0, flat_idx, ref_flat)
+
+    counts = counts.view(B, bins, bins, bins)
+    drift_sum = drift_sum.view(B, bins, bins, bins, 3)
+    ref_sum = ref_sum.view(B, bins, bins, bins, 3)
+
+    valid = counts > 0
+    c = counts.unsqueeze(-1).clamp_min(1e-8)
+    drift_mean = drift_sum / c
+    ref_mean = ref_sum / c
+
+    if mode == "additive":
+        correction = ref_mean - drift_mean
+        identity = torch.zeros_like(correction)
+    elif mode == "multiplicative":
+        correction = ref_mean / drift_mean.clamp_min(1e-6)
+        identity = torch.ones_like(correction)
+    else:  # hybrid
+        luma_ratio = ref_mean[..., :1] / drift_mean[..., :1].clamp_min(1e-6)
+        chroma_delta = ref_mean[..., 1:] - drift_mean[..., 1:]
+        correction = torch.cat([luma_ratio, chroma_delta], dim=-1)
+        identity = torch.zeros_like(correction)
+        identity[..., 0] = 1.0  # luma identity = ratio 1
+
+    # Pre-fill empty bins with identity so bins unreachable by NN expansion are neutral
+    correction = torch.where(valid.unsqueeze(-1), correction, identity)
+
+    # Nearest-neighbour fill: propagate valid-bin values into empty neighbours
+    correction = _fill_lut_nn(correction, valid)
+
     return {
-        "delta_sum": delta_sum,
-        "counts": counts,
-        "global_delta": global_delta,
-        "bins": torch.tensor(int(bins), device=device),
+        "correction": correction.to(orig_dtype),
+        "bins": torch.tensor(bins, device=device),
+        "mode": mode,
     }
 
 
@@ -106,21 +183,35 @@ def _lookup_delta(
     generated_band: torch.Tensor,
     lookup: dict[str, torch.Tensor],
 ) -> torch.Tensor:
+    """
+    Look up per-pixel additive delta from the pre-built LUT.
+    Always returns a tensor to ADD to generated YUV.
+    """
     bins = int(lookup["bins"].item())
-    qy, qu, qv = _quantize_yuv(generated_band, bins)
-    batch, _, height, width = generated_band.shape
-    out = torch.zeros_like(generated_band)
-    delta_sum = lookup["delta_sum"]
-    counts = lookup["counts"]
-    global_delta = lookup["global_delta"]
-    for b in range(batch):
-        side_sum = delta_sum[b][qy[b], qu[b], qv[b]]
-        side_count = counts[b][qy[b], qu[b], qv[b]].unsqueeze(0)
-        mean_delta = side_sum.permute(2, 0, 1) / side_count.clamp_min(1e-6)
-        fallback = global_delta[b].view(3, 1, 1).expand(3, height, width)
-        out[b] = torch.where(side_count > 0.0, mean_delta, fallback)
-    return out
+    mode = lookup["mode"]
+    correction = lookup["correction"]  # [B, bins, bins, bins, 3]
 
+    qy, qu, qv = _quantize_yuv(generated_band, bins)
+    B = generated_band.shape[0]
+
+    b_idx = torch.arange(B, device=generated_band.device).view(B, 1, 1)
+    looked_up = correction[b_idx, qy, qu, qv]  # [B, H, W, 3]
+    looked_up = looked_up.permute(0, 3, 1, 2)  # [B, 3, H, W]
+
+    if mode == "additive":
+        return looked_up
+    elif mode == "multiplicative":
+        # corrected = gen * ratio  →  delta = gen * (ratio - 1)
+        return generated_band * (looked_up - 1.0)
+    else:  # hybrid
+        luma_delta = generated_band[:, :1] * (looked_up[:, :1] - 1.0)
+        chroma_delta = looked_up[:, 1:]
+        return torch.cat([luma_delta, chroma_delta], dim=1)
+
+
+# ---------------------------------------------------------------------------
+# Strip extraction and delta placement
+# ---------------------------------------------------------------------------
 
 def _extract_outer_side_strip(
     image: torch.Tensor,
@@ -150,18 +241,6 @@ def _extract_outer_side_strip(
         if band <= 0:
             return None
         return image[:, :, y1 : y1 + band, x0:x1]
-    raise ValueError(f"unsupported side: {side}")
-
-
-def _canonicalize_side_strip(strip: torch.Tensor, side: str) -> torch.Tensor:
-    if side == "left":
-        return strip.flip(-1)
-    if side == "right":
-        return strip
-    if side == "top":
-        return strip.flip(-2)
-    if side == "bottom":
-        return strip
     raise ValueError(f"unsupported side: {side}")
 
 
@@ -208,15 +287,19 @@ def _place_side_delta(
     if side == "left":
         target[:, :, y0:y1, x0 : x0 + delta.shape[-1]] = delta
     elif side == "right":
-        target[:, :, y0:y1, x1 - delta.shape[-1] : x1] = delta.flip(-1)
+        target[:, :, y0:y1, x1 - delta.shape[-1] : x1] = delta
     elif side == "top":
         target[:, :, y0 : y0 + delta.shape[-2], x0:x1] = delta
     elif side == "bottom":
-        target[:, :, y1 - delta.shape[-2] : y1, x0:x1] = delta.flip(-2)
+        target[:, :, y1 - delta.shape[-2] : y1, x0:x1] = delta
     else:
         raise ValueError(f"unsupported side: {side}")
     return target
 
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 def apply_neighbor_tone_match(
     reference_rgb: torch.Tensor,
@@ -230,9 +313,12 @@ def apply_neighbor_tone_match(
     process_right: bool,
     process_top: bool,
     process_bottom: bool,
-    downsample_short_side: int,
     luma_strength: float,
     chroma_strength: float,
+    bins: int = 32,
+    correction_mode: str = "hybrid",
+    color_space: str = "linear",
+    corner_px: float | None = None,
 ) -> tuple[torch.Tensor, dict]:
     if reference_rgb.ndim != 4 or drift_source_rgb.ndim != 4 or generated_rgb.ndim != 4:
         raise ValueError("reference_rgb, drift_source_rgb, and generated_rgb must be BCHW")
@@ -262,10 +348,22 @@ def apply_neighbor_tone_match(
     if not sides:
         return generated_rgb, {"reason": "no_processable_sides", "side_deltas": {}, "weights": {}, "bbox": bbox}
 
-    reference_yuv = _rgb_to_yuv(reference_rgb)
-    drift_source_yuv = _rgb_to_yuv(drift_source_rgb)
-    generated_yuv = _rgb_to_yuv(generated_rgb)
-    channel_scale = reference_yuv.new_tensor([float(luma_strength), float(chroma_strength), float(chroma_strength)]).view(1, 3, 1, 1)
+    # Optionally linearise before YUV conversion
+    if color_space == "srgb":
+        ref_lin = _srgb_to_linear(reference_rgb)
+        drift_lin = _srgb_to_linear(drift_source_rgb)
+        gen_lin = _srgb_to_linear(generated_rgb)
+    else:
+        ref_lin = reference_rgb
+        drift_lin = drift_source_rgb
+        gen_lin = generated_rgb
+
+    reference_yuv = _rgb_to_yuv(ref_lin)
+    drift_source_yuv = _rgb_to_yuv(drift_lin)
+    generated_yuv = _rgb_to_yuv(gen_lin)
+    channel_scale = reference_yuv.new_tensor(
+        [float(luma_strength), float(chroma_strength), float(chroma_strength)]
+    ).view(1, 3, 1, 1)
 
     side_deltas: dict[str, torch.Tensor] = {}
     per_side_meta: dict[str, dict] = {}
@@ -275,18 +373,12 @@ def apply_neighbor_tone_match(
         generated_inner = _extract_inner_side_band(generated_yuv, bbox, side, int(inner_width))
         if reference_outer is None or drift_outer is None or generated_inner is None:
             continue
-        reference_outer = _canonicalize_side_strip(reference_outer, side)
-        drift_outer = _canonicalize_side_strip(drift_outer, side)
-        generated_inner = _canonicalize_side_strip(generated_inner, side)
-        reference_small = _resize_preserve_short_side(reference_outer, int(downsample_short_side))
-        drift_small = _resize_preserve_short_side(drift_outer, int(downsample_short_side))
-        lookup = _build_delta_lookup(drift_small, reference_small)
+        lookup = _build_delta_lookup(drift_outer, reference_outer, bins=int(bins), mode=correction_mode)
         delta_band = _lookup_delta(generated_inner, lookup) * channel_scale
         placed = _place_side_delta(delta_band, bbox, side, generated_yuv.shape)
         side_deltas[side] = placed
         per_side_meta[side] = {
             "band_shape": [int(v) for v in generated_inner.shape[-2:]],
-            "lookup_strip_shape": [int(v) for v in drift_small.shape[-2:]],
             "mean_abs_delta": float(delta_band.abs().mean().item()),
         }
 
@@ -299,9 +391,16 @@ def apply_neighbor_tone_match(
         bbox=bbox,
         inner_width=int(inner_width),
         blend_falloff_px=int(inner_falloff_px),
+        corner_px=corner_px,
     )
     corrected_yuv = generated_yuv + merged_delta
-    corrected_rgb = _yuv_to_rgb(corrected_yuv).clamp(0.0, 1.0)
+    corrected_lin = _yuv_to_rgb(corrected_yuv).clamp(0.0, 1.0)
+
+    if color_space == "srgb":
+        corrected_rgb = _linear_to_srgb(corrected_lin)
+    else:
+        corrected_rgb = corrected_lin
+
     return corrected_rgb, {
         "reason": "applied",
         "bbox": bbox,
@@ -311,6 +410,10 @@ def apply_neighbor_tone_match(
         "per_side": per_side_meta,
     }
 
+
+# ---------------------------------------------------------------------------
+# Debug output
+# ---------------------------------------------------------------------------
 
 def write_neighbor_tone_debug(
     reference_rgb: torch.Tensor,
