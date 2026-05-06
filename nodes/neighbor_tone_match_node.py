@@ -12,6 +12,7 @@ class NeighborToneMatchNode:
         return {
             "required": {
                 "reference_image": ("IMAGE",),
+                "drift_source_image": ("IMAGE",),
                 "generated_image": ("IMAGE",),
                 "mask": ("MASK",),
                 "inner_width": ("INT", {"default": 128, "min": 1, "max": 1024, "step": 1}),
@@ -35,6 +36,7 @@ class NeighborToneMatchNode:
     def run(
         self,
         reference_image,
+        drift_source_image,
         generated_image,
         mask,
         inner_width,
@@ -48,11 +50,13 @@ class NeighborToneMatchNode:
         chroma_strength,
         debug_previews,
     ):
-        if reference_image.shape != generated_image.shape:
-            raise ValueError("reference_image and generated_image must have the same shape")
+        if reference_image.shape != generated_image.shape or reference_image.shape != drift_source_image.shape:
+            raise ValueError("reference_image, drift_source_image, and generated_image must have the same shape")
         ref_bchw = reference_image.permute(0, 3, 1, 2).contiguous()
+        drift_bchw = drift_source_image.permute(0, 3, 1, 2).contiguous()
         gen_bchw = generated_image.permute(0, 3, 1, 2).contiguous()
         ref_rgb = ref_bchw[:, :3]
+        drift_rgb = drift_bchw[:, :3]
         gen_rgb = gen_bchw[:, :3]
         alpha = gen_bchw[:, 3:] if gen_bchw.shape[1] > 3 else None
         if mask.ndim == 3:
@@ -64,6 +68,7 @@ class NeighborToneMatchNode:
 
         corrected_rgb, debug = apply_neighbor_tone_match(
             ref_rgb,
+            drift_rgb,
             gen_rgb,
             mask_t,
             inner_width=int(inner_width),

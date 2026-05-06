@@ -41,79 +41,158 @@ def _lowpass_preserve_aspect(x: torch.Tensor, short_side: int) -> torch.Tensor:
     return F.interpolate(down, size=(height, width), mode="bilinear", align_corners=False)
 
 
-def _reduce_side_delta(delta: torch.Tensor, side: str) -> torch.Tensor:
-    if side in {"left", "right"}:
-        return delta.mean(dim=-1, keepdim=True)
-    if side in {"top", "bottom"}:
-        return delta.mean(dim=-2, keepdim=True)
-    raise ValueError(f"unsupported side: {side}")
-
-
-def _lowpass_side_profile(
-    profile: torch.Tensor,
-    *,
-    side: str,
-    original_strip_shape: tuple[int, int],
-    short_side: int,
-) -> torch.Tensor:
+def _resize_preserve_short_side(x: torch.Tensor, short_side: int) -> torch.Tensor:
     short_side = max(int(short_side), 1)
-    strip_h, strip_w = original_strip_shape
-    strip_short = min(strip_h, strip_w)
-    if strip_short <= short_side:
-        return profile
-    scale = float(short_side) / float(strip_short)
-    if side in {"left", "right"}:
-        length = profile.shape[-2]
-        target_length = max(1, int(round(length * scale)))
-        if target_length >= length:
-            return profile
-        down = F.interpolate(profile, size=(target_length, 1), mode="bilinear", align_corners=False)
-        return F.interpolate(down, size=(length, 1), mode="bilinear", align_corners=False)
-    length = profile.shape[-1]
-    target_length = max(1, int(round(length * scale)))
-    if target_length >= length:
-        return profile
-    down = F.interpolate(profile, size=(1, target_length), mode="bilinear", align_corners=False)
-    return F.interpolate(down, size=(1, length), mode="bilinear", align_corners=False)
+    height, width = x.shape[-2:]
+    current_short = min(height, width)
+    if current_short <= short_side:
+        return x
+    scale = float(short_side) / float(current_short)
+    target_h = max(1, int(round(height * scale)))
+    target_w = max(1, int(round(width * scale)))
+    return F.interpolate(x, size=(target_h, target_w), mode="bilinear", align_corners=False)
 
 
-def _extract_side_pair(
-    reference: torch.Tensor,
-    generated: torch.Tensor,
+def _normalize_yuv_for_lookup(yuv: torch.Tensor) -> torch.Tensor:
+    out = yuv.clone()
+    out[:, 0:1] = out[:, 0:1].clamp(0.0, 1.0)
+    out[:, 1:2] = ((out[:, 1:2] + 0.436) / 0.872).clamp(0.0, 1.0)
+    out[:, 2:3] = ((out[:, 2:3] + 0.615) / 1.23).clamp(0.0, 1.0)
+    return out
+
+
+def _quantize_yuv(yuv: torch.Tensor, bins: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bins = max(int(bins), 2)
+    norm = _normalize_yuv_for_lookup(yuv)
+    q = (norm * float(bins - 1)).round().long().clamp(0, bins - 1)
+    return q[:, 0], q[:, 1], q[:, 2]
+
+
+def _build_delta_lookup(
+    generated_strip: torch.Tensor,
+    original_strip: torch.Tensor,
+    *,
+    bins: int = 24,
+) -> dict[str, torch.Tensor]:
+    if generated_strip.shape != original_strip.shape:
+        raise ValueError("generated_strip and original_strip must have the same shape")
+    device = generated_strip.device
+    dtype = generated_strip.dtype
+    batch = generated_strip.shape[0]
+    delta = original_strip - generated_strip
+    qy, qu, qv = _quantize_yuv(generated_strip, bins)
+    delta_sum = torch.zeros(batch, bins, bins, bins, 3, device=device, dtype=dtype)
+    counts = torch.zeros(batch, bins, bins, bins, device=device, dtype=dtype)
+    global_delta = delta.mean(dim=(-2, -1))
+    for b in range(batch):
+        ys = qy[b].reshape(-1)
+        us = qu[b].reshape(-1)
+        vs = qv[b].reshape(-1)
+        vals = delta[b].permute(1, 2, 0).reshape(-1, 3)
+        flat_idx = ys * (bins * bins) + us * bins + vs
+        delta_sum_flat = delta_sum[b].view(-1, 3)
+        counts_flat = counts[b].view(-1)
+        counts_flat.index_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=dtype))
+        delta_sum_flat.index_add_(0, flat_idx, vals)
+    return {
+        "delta_sum": delta_sum,
+        "counts": counts,
+        "global_delta": global_delta,
+        "bins": torch.tensor(int(bins), device=device),
+    }
+
+
+def _lookup_delta(
+    generated_band: torch.Tensor,
+    lookup: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    bins = int(lookup["bins"].item())
+    qy, qu, qv = _quantize_yuv(generated_band, bins)
+    batch, _, height, width = generated_band.shape
+    out = torch.zeros_like(generated_band)
+    delta_sum = lookup["delta_sum"]
+    counts = lookup["counts"]
+    global_delta = lookup["global_delta"]
+    for b in range(batch):
+        side_sum = delta_sum[b][qy[b], qu[b], qv[b]]
+        side_count = counts[b][qy[b], qu[b], qv[b]].unsqueeze(0)
+        mean_delta = side_sum.permute(2, 0, 1) / side_count.clamp_min(1e-6)
+        fallback = global_delta[b].view(3, 1, 1).expand(3, height, width)
+        out[b] = torch.where(side_count > 0.0, mean_delta, fallback)
+    return out
+
+
+def _extract_outer_side_strip(
+    image: torch.Tensor,
     bbox: tuple[int, int, int, int],
     side: str,
     band_width: int,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+) -> torch.Tensor | None:
     x0, y0, x1, y1 = bbox
-    _, _, height, width = reference.shape
+    _, _, height, width = image.shape
     if side == "left":
-        band = min(int(band_width), x0, x1 - x0)
+        band = min(int(band_width), x0)
         if band <= 0:
-            return None, None
-        outer = reference[:, :, y0:y1, x0 - band : x0].flip(-1)
-        inner = generated[:, :, y0:y1, x0 : x0 + band]
-        return outer, inner
+            return None
+        return image[:, :, y0:y1, x0 - band : x0]
     if side == "right":
-        band = min(int(band_width), width - x1, x1 - x0)
+        band = min(int(band_width), width - x1)
         if band <= 0:
-            return None, None
-        outer = reference[:, :, y0:y1, x1 : x1 + band]
-        inner = generated[:, :, y0:y1, x1 - band : x1].flip(-1)
-        return outer, inner
+            return None
+        return image[:, :, y0:y1, x1 : x1 + band]
     if side == "top":
-        band = min(int(band_width), y0, y1 - y0)
+        band = min(int(band_width), y0)
         if band <= 0:
-            return None, None
-        outer = reference[:, :, y0 - band : y0, x0:x1].flip(-2)
-        inner = generated[:, :, y0 : y0 + band, x0:x1]
-        return outer, inner
+            return None
+        return image[:, :, y0 - band : y0, x0:x1]
     if side == "bottom":
-        band = min(int(band_width), height - y1, y1 - y0)
+        band = min(int(band_width), height - y1)
         if band <= 0:
-            return None, None
-        outer = reference[:, :, y1 : y1 + band, x0:x1]
-        inner = generated[:, :, y1 - band : y1, x0:x1].flip(-2)
-        return outer, inner
+            return None
+        return image[:, :, y1 : y1 + band, x0:x1]
+    raise ValueError(f"unsupported side: {side}")
+
+
+def _canonicalize_side_strip(strip: torch.Tensor, side: str) -> torch.Tensor:
+    if side == "left":
+        return strip.flip(-1)
+    if side == "right":
+        return strip
+    if side == "top":
+        return strip.flip(-2)
+    if side == "bottom":
+        return strip
+    raise ValueError(f"unsupported side: {side}")
+
+
+def _extract_inner_side_band(
+    image: torch.Tensor,
+    bbox: tuple[int, int, int, int],
+    side: str,
+    band_width: int,
+) -> torch.Tensor | None:
+    x0, y0, x1, y1 = bbox
+    _, _, height, width = image.shape
+    if side == "left":
+        band = min(int(band_width), x1 - x0)
+        if band <= 0:
+            return None
+        return image[:, :, y0:y1, x0 : x0 + band]
+    if side == "right":
+        band = min(int(band_width), x1 - x0)
+        if band <= 0:
+            return None
+        return image[:, :, y0:y1, x1 - band : x1]
+    if side == "top":
+        band = min(int(band_width), y1 - y0)
+        if band <= 0:
+            return None
+        return image[:, :, y0 : y0 + band, x0:x1]
+    if side == "bottom":
+        band = min(int(band_width), y1 - y0)
+        if band <= 0:
+            return None
+        return image[:, :, y1 - band : y1, x0:x1]
     raise ValueError(f"unsupported side: {side}")
 
 
@@ -139,32 +218,9 @@ def _place_side_delta(
     return target
 
 
-def _place_side_profile_delta(
-    profile: torch.Tensor,
-    bbox: tuple[int, int, int, int],
-    side: str,
-    band_width: int,
-    full_shape: tuple[int, int, int, int],
-) -> torch.Tensor:
-    batch, channels, height, width = full_shape
-    target = torch.zeros(batch, channels, height, width, device=profile.device, dtype=profile.dtype)
-    x0, y0, x1, y1 = bbox
-    band = max(int(band_width), 1)
-    if side == "left":
-        target[:, :, y0:y1, x0 : x0 + band] = profile.expand(-1, -1, -1, band)
-    elif side == "right":
-        target[:, :, y0:y1, x1 - band : x1] = profile.expand(-1, -1, -1, band)
-    elif side == "top":
-        target[:, :, y0 : y0 + band, x0:x1] = profile.expand(-1, -1, band, -1)
-    elif side == "bottom":
-        target[:, :, y1 - band : y1, x0:x1] = profile.expand(-1, -1, band, -1)
-    else:
-        raise ValueError(f"unsupported side: {side}")
-    return target
-
-
 def apply_neighbor_tone_match(
     reference_rgb: torch.Tensor,
+    drift_source_rgb: torch.Tensor,
     generated_rgb: torch.Tensor,
     mask: torch.Tensor,
     *,
@@ -178,10 +234,10 @@ def apply_neighbor_tone_match(
     luma_strength: float,
     chroma_strength: float,
 ) -> tuple[torch.Tensor, dict]:
-    if reference_rgb.ndim != 4 or generated_rgb.ndim != 4:
-        raise ValueError("reference_rgb and generated_rgb must be BCHW")
-    if reference_rgb.shape != generated_rgb.shape:
-        raise ValueError("reference_rgb and generated_rgb must have the same shape")
+    if reference_rgb.ndim != 4 or drift_source_rgb.ndim != 4 or generated_rgb.ndim != 4:
+        raise ValueError("reference_rgb, drift_source_rgb, and generated_rgb must be BCHW")
+    if reference_rgb.shape != generated_rgb.shape or reference_rgb.shape != drift_source_rgb.shape:
+        raise ValueError("reference_rgb, drift_source_rgb, and generated_rgb must have the same shape")
 
     mask = mask.float()
     if mask.ndim == 3:
@@ -207,29 +263,31 @@ def apply_neighbor_tone_match(
         return generated_rgb, {"reason": "no_processable_sides", "side_deltas": {}, "weights": {}, "bbox": bbox}
 
     reference_yuv = _rgb_to_yuv(reference_rgb)
+    drift_source_yuv = _rgb_to_yuv(drift_source_rgb)
     generated_yuv = _rgb_to_yuv(generated_rgb)
     channel_scale = reference_yuv.new_tensor([float(luma_strength), float(chroma_strength), float(chroma_strength)]).view(1, 3, 1, 1)
 
     side_deltas: dict[str, torch.Tensor] = {}
     per_side_meta: dict[str, dict] = {}
     for side in sides:
-        outer, inner = _extract_side_pair(reference_yuv, generated_yuv, bbox, side, int(inner_width))
-        if outer is None or inner is None:
+        reference_outer = _extract_outer_side_strip(reference_yuv, bbox, side, int(inner_width))
+        drift_outer = _extract_outer_side_strip(drift_source_yuv, bbox, side, int(inner_width))
+        generated_inner = _extract_inner_side_band(generated_yuv, bbox, side, int(inner_width))
+        if reference_outer is None or drift_outer is None or generated_inner is None:
             continue
-        delta = outer - inner
-        profile = _reduce_side_delta(delta, side)
-        profile = _lowpass_side_profile(
-            profile,
-            side=side,
-            original_strip_shape=(delta.shape[-2], delta.shape[-1]),
-            short_side=int(downsample_short_side),
-        )
-        placed = _place_side_profile_delta(profile * channel_scale, bbox, side, int(inner_width), generated_yuv.shape)
+        reference_outer = _canonicalize_side_strip(reference_outer, side)
+        drift_outer = _canonicalize_side_strip(drift_outer, side)
+        generated_inner = _canonicalize_side_strip(generated_inner, side)
+        reference_small = _resize_preserve_short_side(reference_outer, int(downsample_short_side))
+        drift_small = _resize_preserve_short_side(drift_outer, int(downsample_short_side))
+        lookup = _build_delta_lookup(drift_small, reference_small)
+        delta_band = _lookup_delta(generated_inner, lookup) * channel_scale
+        placed = _place_side_delta(delta_band, bbox, side, generated_yuv.shape)
         side_deltas[side] = placed
         per_side_meta[side] = {
-            "band_shape": [int(v) for v in delta.shape[-2:]],
-            "profile_shape": [int(v) for v in profile.shape[-2:]],
-            "mean_abs_delta": float(profile.abs().mean().item()),
+            "band_shape": [int(v) for v in generated_inner.shape[-2:]],
+            "lookup_strip_shape": [int(v) for v in drift_small.shape[-2:]],
+            "mean_abs_delta": float(delta_band.abs().mean().item()),
         }
 
     if not side_deltas:
