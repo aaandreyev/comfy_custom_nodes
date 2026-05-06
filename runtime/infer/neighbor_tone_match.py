@@ -780,29 +780,6 @@ def _freeform_inner_weight(
     return weight.astype(np.float32)
 
 
-def _freeform_donor_zone_mask(
-    shape: tuple[int, int],
-    bbox: tuple[int, int, int, int],
-    *,
-    process_left: bool,
-    process_right: bool,
-    process_top: bool,
-    process_bottom: bool,
-) -> np.ndarray:
-    height, width = shape
-    x0, y0, x1, y1 = bbox
-    zone = np.zeros((height, width), dtype=bool)
-    if process_left and x0 > 0:
-        zone[:, :x0] = True
-    if process_right and x1 < width:
-        zone[:, x1:] = True
-    if process_top and y0 > 0:
-        zone[:y0, :] = True
-    if process_bottom and y1 < height:
-        zone[y1:, :] = True
-    return zone
-
-
 def apply_freeform_neighbor_tone_match(
     reference_rgb: torch.Tensor,
     image_rgb: torch.Tensor,
@@ -811,10 +788,6 @@ def apply_freeform_neighbor_tone_match(
     inner_width: int,
     inner_flat_top_px: int | None = None,
     inner_falloff_px: int | None = None,
-    process_left: bool,
-    process_right: bool,
-    process_top: bool,
-    process_bottom: bool,
     luma_strength: float,
     chroma_strength: float,
     u_strength: float | None = None,
@@ -863,7 +836,6 @@ def apply_freeform_neighbor_tone_match(
     corrected_batches: list[torch.Tensor] = []
     debug_items: list[dict] = []
     outer_width = int(inner_width if outer_band_px is None else outer_band_px)
-    has_allowed_side = any((process_left, process_right, process_top, process_bottom))
 
     for idx in range(reference_rgb.shape[0]):
         mask_np = soft_mask[idx, 0].detach().cpu().numpy().astype(np.float32)
@@ -872,23 +844,11 @@ def apply_freeform_neighbor_tone_match(
             corrected_batches.append(image_rgb[idx : idx + 1])
             debug_items.append({"reason": "empty_mask", "bbox": bbox})
             continue
-        if not has_allowed_side:
-            corrected_batches.append(image_rgb[idx : idx + 1])
-            debug_items.append({"reason": "no_processable_sides", "bbox": bbox})
-            continue
 
-        donor_zone = _freeform_donor_zone_mask(
-            mask_bool.shape,
-            bbox,
-            process_left=process_left,
-            process_right=process_right,
-            process_top=process_top,
-            process_bottom=process_bottom,
-        )
         outside = ~mask_bool
         dist_out = distance_transform_edt(outside).astype(np.float32)
         dist_in = distance_transform_edt(mask_bool).astype(np.float32)
-        outer_band = outside & donor_zone & (dist_out > 0.0) & (dist_out <= float(max(outer_width, 1)))
+        outer_band = outside & (dist_out > 0.0) & (dist_out <= float(max(outer_width, 1)))
         inner_band = mask_bool & (dist_in > 0.0) & (dist_in <= float(max(int(inner_width), 1)))
 
         if not np.any(outer_band):

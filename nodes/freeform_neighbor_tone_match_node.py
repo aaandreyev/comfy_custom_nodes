@@ -19,10 +19,6 @@ class FreeformNeighborToneMatchNode:
                                    "tooltip": "Reference strip width outside the free-form mask used to build the LUT."}),
                 "inner_flat_top_px": ("INT", {"default": 48, "min": 0, "max": 1024, "step": 1,
                                       "tooltip": "Flat-top region inside the corrected band before the inward fade starts."}),
-                "process_left": ("BOOLEAN", {"default": True}),
-                "process_right": ("BOOLEAN", {"default": True}),
-                "process_top": ("BOOLEAN", {"default": True}),
-                "process_bottom": ("BOOLEAN", {"default": True}),
                 "luma_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.05}),
                 "chroma_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.05}),
                 "u_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.05}),
@@ -33,8 +29,6 @@ class FreeformNeighborToneMatchNode:
                 "color_space": (["srgb", "linear"], {"default": "srgb"}),
                 "yuv_matrix": (["bt709", "bt601"], {"default": "bt709"}),
                 "delta_smoothing_sigma": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 16.0, "step": 0.25}),
-                "corner_px": ("INT", {"default": -1, "min": -1, "max": 512, "step": 1,
-                               "tooltip": "Kept for UI parity; not used by the free-form solver."}),
                 "debug_previews": ("BOOLEAN", {"default": False}),
             }
         }
@@ -52,10 +46,6 @@ class FreeformNeighborToneMatchNode:
         inner_width,
         outer_band_px,
         inner_flat_top_px,
-        process_left,
-        process_right,
-        process_top,
-        process_bottom,
         luma_strength,
         chroma_strength,
         u_strength,
@@ -66,10 +56,8 @@ class FreeformNeighborToneMatchNode:
         color_space,
         yuv_matrix,
         delta_smoothing_sigma,
-        corner_px,
         debug_previews,
     ):
-        del corner_px
         if reference_image.shape != image.shape:
             raise ValueError("reference_image and image must have the same shape")
 
@@ -93,10 +81,6 @@ class FreeformNeighborToneMatchNode:
             inner_width=int(inner_width),
             outer_band_px=int(outer_band_px),
             inner_flat_top_px=int(inner_flat_top_px),
-            process_left=bool(process_left),
-            process_right=bool(process_right),
-            process_top=bool(process_top),
-            process_bottom=bool(process_bottom),
             luma_strength=float(luma_strength),
             chroma_strength=float(chroma_strength),
             u_strength=float(u_strength),
