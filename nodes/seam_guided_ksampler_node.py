@@ -74,6 +74,8 @@ class SeamGuidedKSamplerNode:
                 "profile_reduce": (["mean", "median"], {"default": "mean"}),
                 "noise_mode": (["mean_shift", "matched_noise"], {"default": "mean_shift"}),
                 "debug": ("BOOLEAN", {"default": False}),
+                "preserve_outside_latent": ("BOOLEAN", {"default": True}),
+                "safety_ring_px": ("INT", {"default": 16, "min": 0, "max": 512, "step": 1}),
             },
         }
 
@@ -111,9 +113,12 @@ class SeamGuidedKSamplerNode:
         profile_reduce="mean",
         noise_mode="mean_shift",
         debug=False,
+        preserve_outside_latent=True,
+        safety_ring_px=16,
     ):
         device = comfy.model_management.get_torch_device()
         latent = latent_image["samples"]
+        reference_latent = latent.float()
         anchor_samples = anchor_latent["samples"].float()
         B, C, H, W = latent.shape
 
@@ -128,6 +133,7 @@ class SeamGuidedKSamplerNode:
             process_top=bool(process_top),
             process_bottom=bool(process_bottom),
             reduce=str(profile_reduce),
+            safety_ring_px=int(safety_ring_px),
         )
 
         comfy.model_management.load_models_gpu([model])
@@ -156,6 +162,20 @@ class SeamGuidedKSamplerNode:
         else:
             x = noise
         x = x.to(device=device, dtype=model_dtype)
+        ref_latent_device = reference_latent.to(device=device, dtype=model_dtype)
+        noise_device = noise.to(device=device, dtype=model_dtype)
+        generation_weight = None
+        if bool(preserve_outside_latent):
+            generation_weight = anchor_state.get("generation_weight")
+            if generation_weight is not None:
+                generation_weight = generation_weight.to(device=device, dtype=model_dtype)
+                if generation_weight.shape[-2:] != x.shape[-2:]:
+                    generation_weight = torch.nn.functional.interpolate(
+                        generation_weight,
+                        size=x.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).clamp(0.0, 1.0)
 
         cond = positive[0][0].to(device=device, dtype=model_dtype)
         if cond.shape[0] != B:
@@ -244,7 +264,7 @@ class SeamGuidedKSamplerNode:
                 temporal = _seam_temporal_strength(i, total_steps, float(seam_noise_ramp_curve))
                 if (
                     seam_noise_strength > 0.0
-                    and anchor_state["sides"]
+                    and (anchor_state["sides"] or anchor_state.get("extra_contributions"))
                     and temporal > 1e-5
                     and active_start <= step_num <= active_end
                 ):
@@ -261,6 +281,9 @@ class SeamGuidedKSamplerNode:
                             f"temporal={temporal:.3f} effective={seam_noise_strength * temporal:.3f} "
                             f"mode={noise_mode}"
                         )
+                if generation_weight is not None:
+                    ref_x = (1.0 - t_prev) * ref_latent_device + t_prev * noise_device
+                    x = x * generation_weight + ref_x * (1.0 - generation_weight)
                 pbar.update(1)
 
         return ({"samples": x.cpu().float()},)

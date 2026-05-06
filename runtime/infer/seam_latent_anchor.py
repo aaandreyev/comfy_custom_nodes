@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.ndimage import distance_transform_edt
 
 from ..strip_ops import mask_bbox
 from .merge_bands import build_seam_local_weight_map
@@ -63,6 +65,30 @@ def _normalize_mask_like(mask: torch.Tensor, reference_shape: tuple[int, int]) -
     if mask.shape[-2:] != reference_shape:
         mask = F.interpolate(mask, size=reference_shape, mode="nearest")
     return (mask > 0.5).float()
+
+
+def _build_sampling_generation_weight(
+    mask: torch.Tensor,
+    *,
+    safety_ring_px: int,
+) -> torch.Tensor:
+    if mask.ndim != 4 or mask.shape[1] != 1:
+        raise ValueError("expected mask with shape [B,1,H,W]")
+    ring = max(int(safety_ring_px), 0)
+    if ring <= 0:
+        return mask.clone()
+
+    batch_weights = []
+    for batch_index in range(mask.shape[0]):
+        mask_np = mask[batch_index, 0].detach().cpu().numpy().astype(np.float32)
+        outside = mask_np <= 0.5
+        dist_to_inside = distance_transform_edt(outside).astype(np.float32)
+        outside_weight = np.clip(((ring + 1.0) - dist_to_inside) / (ring + 1.0), 0.0, 1.0)
+        generation_weight = np.where(mask_np > 0.5, 1.0, outside_weight).astype(np.float32)
+        batch_weights.append(torch.from_numpy(generation_weight))
+
+    stacked = torch.stack(batch_weights, dim=0).unsqueeze(1)
+    return stacked.to(device=mask.device, dtype=mask.dtype)
 
 
 def _position_zone_mask(
@@ -663,6 +689,7 @@ def prepare_seam_anchor_state(
     process_bottom: bool = True,
     reduce: str = "mean",
     profile_smooth_kernel: int = 5,
+    safety_ring_px: int = 0,
 ) -> dict:
     if anchor_latent.ndim != 4:
         raise ValueError("expected anchor_latent with shape [B,C,H,W]")
@@ -738,10 +765,15 @@ def prepare_seam_anchor_state(
         process_top=process_top,
         process_bottom=process_bottom,
     )
+    generation_weight = _build_sampling_generation_weight(
+        mask,
+        safety_ring_px=safety_ring_px,
+    )
 
     return {
         "bbox": bbox,
         "mask": mask,
+        "generation_weight": generation_weight,
         "sides": tuple(per_side_profiles.keys()),
         "present_positions": tuple(sorted(present_positions)),
         "profiles": per_side_profiles,
