@@ -41,6 +41,42 @@ def _lowpass_preserve_aspect(x: torch.Tensor, short_side: int) -> torch.Tensor:
     return F.interpolate(down, size=(height, width), mode="bilinear", align_corners=False)
 
 
+def _reduce_side_delta(delta: torch.Tensor, side: str) -> torch.Tensor:
+    if side in {"left", "right"}:
+        return delta.mean(dim=-1, keepdim=True)
+    if side in {"top", "bottom"}:
+        return delta.mean(dim=-2, keepdim=True)
+    raise ValueError(f"unsupported side: {side}")
+
+
+def _lowpass_side_profile(
+    profile: torch.Tensor,
+    *,
+    side: str,
+    original_strip_shape: tuple[int, int],
+    short_side: int,
+) -> torch.Tensor:
+    short_side = max(int(short_side), 1)
+    strip_h, strip_w = original_strip_shape
+    strip_short = min(strip_h, strip_w)
+    if strip_short <= short_side:
+        return profile
+    scale = float(short_side) / float(strip_short)
+    if side in {"left", "right"}:
+        length = profile.shape[-2]
+        target_length = max(1, int(round(length * scale)))
+        if target_length >= length:
+            return profile
+        down = F.interpolate(profile, size=(target_length, 1), mode="bilinear", align_corners=False)
+        return F.interpolate(down, size=(length, 1), mode="bilinear", align_corners=False)
+    length = profile.shape[-1]
+    target_length = max(1, int(round(length * scale)))
+    if target_length >= length:
+        return profile
+    down = F.interpolate(profile, size=(1, target_length), mode="bilinear", align_corners=False)
+    return F.interpolate(down, size=(1, length), mode="bilinear", align_corners=False)
+
+
 def _extract_side_pair(
     reference: torch.Tensor,
     generated: torch.Tensor,
@@ -103,6 +139,30 @@ def _place_side_delta(
     return target
 
 
+def _place_side_profile_delta(
+    profile: torch.Tensor,
+    bbox: tuple[int, int, int, int],
+    side: str,
+    band_width: int,
+    full_shape: tuple[int, int, int, int],
+) -> torch.Tensor:
+    batch, channels, height, width = full_shape
+    target = torch.zeros(batch, channels, height, width, device=profile.device, dtype=profile.dtype)
+    x0, y0, x1, y1 = bbox
+    band = max(int(band_width), 1)
+    if side == "left":
+        target[:, :, y0:y1, x0 : x0 + band] = profile.expand(-1, -1, -1, band)
+    elif side == "right":
+        target[:, :, y0:y1, x1 - band : x1] = profile.expand(-1, -1, -1, band)
+    elif side == "top":
+        target[:, :, y0 : y0 + band, x0:x1] = profile.expand(-1, -1, band, -1)
+    elif side == "bottom":
+        target[:, :, y1 - band : y1, x0:x1] = profile.expand(-1, -1, band, -1)
+    else:
+        raise ValueError(f"unsupported side: {side}")
+    return target
+
+
 def apply_neighbor_tone_match(
     reference_rgb: torch.Tensor,
     generated_rgb: torch.Tensor,
@@ -157,12 +217,19 @@ def apply_neighbor_tone_match(
         if outer is None or inner is None:
             continue
         delta = outer - inner
-        delta = _lowpass_preserve_aspect(delta, int(downsample_short_side))
-        placed = _place_side_delta(delta * channel_scale, bbox, side, generated_yuv.shape)
+        profile = _reduce_side_delta(delta, side)
+        profile = _lowpass_side_profile(
+            profile,
+            side=side,
+            original_strip_shape=(delta.shape[-2], delta.shape[-1]),
+            short_side=int(downsample_short_side),
+        )
+        placed = _place_side_profile_delta(profile * channel_scale, bbox, side, int(inner_width), generated_yuv.shape)
         side_deltas[side] = placed
         per_side_meta[side] = {
             "band_shape": [int(v) for v in delta.shape[-2:]],
-            "mean_abs_delta": float(delta.abs().mean().item()),
+            "profile_shape": [int(v) for v in profile.shape[-2:]],
+            "mean_abs_delta": float(profile.abs().mean().item()),
         }
 
     if not side_deltas:
