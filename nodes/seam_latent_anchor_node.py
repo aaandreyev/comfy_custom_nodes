@@ -26,6 +26,8 @@ class SeamLatentAnchorNode:
                 "ramp_curve": ("FLOAT", {"default": 1.5, "min": 0.5, "max": 8.0, "step": 0.1}),
                 "profile_reduce": (["mean", "median"], {"default": "mean"}),
                 "debug": ("BOOLEAN", {"default": False}),
+                "low_freq_anchor_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "low_freq_anchor_decay_px": ("INT", {"default": 64, "min": 1, "max": 1024, "step": 1}),
             },
         }
 
@@ -49,8 +51,10 @@ class SeamLatentAnchorNode:
         ramp_curve=1.5,
         profile_reduce="mean",
         debug=False,
+        low_freq_anchor_strength=0.0,
+        low_freq_anchor_decay_px=64,
     ):
-        if strength <= 0.0:
+        if strength <= 0.0 and float(low_freq_anchor_strength) <= 0.0:
             return (model,)
         samples = anchor_latent["samples"].float()
         anchor_state = prepare_seam_anchor_state(
@@ -64,8 +68,13 @@ class SeamLatentAnchorNode:
             process_top=bool(process_top),
             process_bottom=bool(process_bottom),
             reduce=str(profile_reduce),
+            low_freq_anchor_decay_px=int(low_freq_anchor_decay_px),
         )
-        if not anchor_state["sides"] and not anchor_state.get("extra_contributions"):
+        if (
+            not anchor_state["sides"]
+            and not anchor_state.get("extra_contributions")
+            and anchor_state.get("low_freq_target") is None
+        ):
             if debug:
                 print("[SeamLatentAnchor] No valid seam context found; node inactive.")
             return (model,)
@@ -106,6 +115,7 @@ class SeamLatentAnchorNode:
                 denoised,
                 _anchor_state,
                 effective,
+                low_freq_strength=float(low_freq_anchor_strength) * curved,
             )
             if _debug and s != _state["last_sigma_logged"]:
                 _state["last_sigma_logged"] = s

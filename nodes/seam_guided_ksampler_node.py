@@ -76,6 +76,8 @@ class SeamGuidedKSamplerNode:
                 "debug": ("BOOLEAN", {"default": False}),
                 "preserve_outside_latent": ("BOOLEAN", {"default": True}),
                 "safety_ring_px": ("INT", {"default": 16, "min": 0, "max": 512, "step": 1}),
+                "low_freq_anchor_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "low_freq_anchor_decay_px": ("INT", {"default": 64, "min": 1, "max": 1024, "step": 1}),
             },
         }
 
@@ -115,6 +117,8 @@ class SeamGuidedKSamplerNode:
         debug=False,
         preserve_outside_latent=True,
         safety_ring_px=16,
+        low_freq_anchor_strength=0.0,
+        low_freq_anchor_decay_px=64,
     ):
         device = comfy.model_management.get_torch_device()
         latent = latent_image["samples"]
@@ -134,6 +138,7 @@ class SeamGuidedKSamplerNode:
             process_bottom=bool(process_bottom),
             reduce=str(profile_reduce),
             safety_ring_px=int(safety_ring_px),
+            low_freq_anchor_decay_px=int(low_freq_anchor_decay_px),
         )
 
         comfy.model_management.load_models_gpu([model])
@@ -263,8 +268,12 @@ class SeamGuidedKSamplerNode:
                 step_num = i + 1
                 temporal = _seam_temporal_strength(i, total_steps, float(seam_noise_ramp_curve))
                 if (
-                    seam_noise_strength > 0.0
-                    and (anchor_state["sides"] or anchor_state.get("extra_contributions"))
+                    (seam_noise_strength > 0.0 or float(low_freq_anchor_strength) > 0.0)
+                    and (
+                        anchor_state["sides"]
+                        or anchor_state.get("extra_contributions")
+                        or anchor_state.get("low_freq_target") is not None
+                    )
                     and temporal > 1e-5
                     and active_start <= step_num <= active_end
                 ):
@@ -274,6 +283,7 @@ class SeamGuidedKSamplerNode:
                         seam_noise_strength * temporal,
                         mode=noise_mode,
                         boundary_only=bool(boundary_only_guidance),
+                        low_freq_strength=float(low_freq_anchor_strength) * temporal,
                     )
                     if debug:
                         print(

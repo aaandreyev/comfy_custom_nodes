@@ -91,6 +91,25 @@ def _build_sampling_generation_weight(
     return stacked.to(device=mask.device, dtype=mask.dtype)
 
 
+def _build_low_freq_anchor_weight(
+    mask: torch.Tensor,
+    *,
+    decay_px: int,
+) -> torch.Tensor:
+    if mask.ndim != 4 or mask.shape[1] != 1:
+        raise ValueError("expected mask with shape [B,1,H,W]")
+    decay = max(int(decay_px), 1)
+    batch_weights = []
+    for batch_index in range(mask.shape[0]):
+        mask_np = mask[batch_index, 0].detach().cpu().numpy().astype(np.float32)
+        inside = mask_np > 0.5
+        dist_in = distance_transform_edt(inside).astype(np.float32)
+        weight = np.exp(-dist_in / float(decay)).astype(np.float32) * inside.astype(np.float32)
+        batch_weights.append(torch.from_numpy(weight))
+    stacked = torch.stack(batch_weights, dim=0).unsqueeze(1)
+    return stacked.to(device=mask.device, dtype=mask.dtype)
+
+
 def _position_zone_mask(
     shape: tuple[int, int],
     bbox: tuple[int, int, int, int],
@@ -246,6 +265,90 @@ def _build_side_share_map(
     if corner in {"nw", "ne"}:
         return 1.0 - t
     return t
+
+
+def _build_low_freq_target_map(
+    bbox: tuple[int, int, int, int],
+    full_shape: tuple[int, int],
+    side_profiles: dict[Side, torch.Tensor],
+    corner_stats: dict[Position, tuple[torch.Tensor, torch.Tensor] | None],
+    present_positions: set[Position],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    x0, y0, x1, y1 = bbox
+    bw = max(x1 - x0, 1)
+    bh = max(y1 - y0, 1)
+    u = torch.linspace(0.0, 1.0, bw, device=device, dtype=dtype).view(1, 1, 1, bw)
+    v = torch.linspace(0.0, 1.0, bh, device=device, dtype=dtype).view(1, 1, bh, 1)
+
+    field_acc = None
+    weight_acc = None
+
+    if "left" in side_profiles and "right" in side_profiles:
+        left = side_profiles["left"].to(device=device, dtype=dtype).expand(-1, -1, -1, bw)
+        right = side_profiles["right"].to(device=device, dtype=dtype).expand(-1, -1, -1, bw)
+        field = left * (1.0 - u) + right * u
+        weight = torch.ones(1, 1, bh, bw, device=device, dtype=dtype)
+        field_acc = field if field_acc is None else field_acc + field
+        weight_acc = weight if weight_acc is None else weight_acc + weight
+    elif "left" in side_profiles:
+        field = side_profiles["left"].to(device=device, dtype=dtype).expand(-1, -1, -1, bw)
+        weight = torch.ones(1, 1, bh, bw, device=device, dtype=dtype)
+        field_acc = field if field_acc is None else field_acc + field
+        weight_acc = weight if weight_acc is None else weight_acc + weight
+    elif "right" in side_profiles:
+        field = side_profiles["right"].to(device=device, dtype=dtype).expand(-1, -1, -1, bw)
+        weight = torch.ones(1, 1, bh, bw, device=device, dtype=dtype)
+        field_acc = field if field_acc is None else field_acc + field
+        weight_acc = weight if weight_acc is None else weight_acc + weight
+
+    if "top" in side_profiles and "bottom" in side_profiles:
+        top = side_profiles["top"].to(device=device, dtype=dtype).expand(-1, -1, bh, -1)
+        bottom = side_profiles["bottom"].to(device=device, dtype=dtype).expand(-1, -1, bh, -1)
+        field = top * (1.0 - v) + bottom * v
+        weight = torch.ones(1, 1, bh, bw, device=device, dtype=dtype)
+        field_acc = field if field_acc is None else field_acc + field
+        weight_acc = weight if weight_acc is None else weight_acc + weight
+    elif "top" in side_profiles:
+        field = side_profiles["top"].to(device=device, dtype=dtype).expand(-1, -1, bh, -1)
+        weight = torch.ones(1, 1, bh, bw, device=device, dtype=dtype)
+        field_acc = field if field_acc is None else field_acc + field
+        weight_acc = weight if weight_acc is None else weight_acc + weight
+    elif "bottom" in side_profiles:
+        field = side_profiles["bottom"].to(device=device, dtype=dtype).expand(-1, -1, bh, -1)
+        weight = torch.ones(1, 1, bh, bw, device=device, dtype=dtype)
+        field_acc = field if field_acc is None else field_acc + field
+        weight_acc = weight if weight_acc is None else weight_acc + weight
+
+    corner_basis = {
+        "nw": (1.0 - u) * (1.0 - v),
+        "ne": u * (1.0 - v),
+        "sw": (1.0 - u) * v,
+        "se": u * v,
+    }
+    corner_field = None
+    corner_weight = None
+    for corner in CORNER_POSITIONS:
+        stats = corner_stats.get(corner)
+        if corner not in present_positions or stats is None:
+            continue
+        mean, _std = stats
+        basis = corner_basis[corner]
+        contrib = mean.to(device=device, dtype=dtype).expand(-1, -1, bh, bw) * basis
+        corner_field = contrib if corner_field is None else corner_field + contrib
+        corner_weight = basis if corner_weight is None else corner_weight + basis
+    if corner_field is not None and corner_weight is not None:
+        field = corner_field / corner_weight.clamp_min(1e-6)
+        weight = torch.ones(1, 1, bh, bw, device=device, dtype=dtype)
+        field_acc = field if field_acc is None else field_acc + field
+        weight_acc = weight if weight_acc is None else weight_acc + weight
+
+    if field_acc is None or weight_acc is None:
+        return None
+    inner = field_acc / weight_acc.clamp_min(1e-6)
+    return _make_bbox_map(bbox, inner, full_shape)
 
 
 def _corner_release_map(
@@ -690,6 +793,7 @@ def prepare_seam_anchor_state(
     reduce: str = "mean",
     profile_smooth_kernel: int = 5,
     safety_ring_px: int = 0,
+    low_freq_anchor_decay_px: int = 64,
 ) -> dict:
     if anchor_latent.ndim != 4:
         raise ValueError("expected anchor_latent with shape [B,C,H,W]")
@@ -753,6 +857,11 @@ def prepare_seam_anchor_state(
         per_side_sample_widths[side] = int(sample_width)
         per_side_std_profiles[side] = std_profile
 
+    corner_stats = {
+        corner: _extract_corner_stats(anchor_latent, bbox, corner, anchor_width_px)
+        for corner in CORNER_POSITIONS
+        if corner in present_positions
+    }
     extra_contributions = _build_extra_contributions(
         anchor_latent,
         mask,
@@ -769,11 +878,26 @@ def prepare_seam_anchor_state(
         mask,
         safety_ring_px=safety_ring_px,
     )
+    low_freq_target = _build_low_freq_target_map(
+        bbox,
+        anchor_latent.shape[-2:],
+        per_side_profiles,
+        corner_stats,
+        present_positions,
+        device=anchor_latent.device,
+        dtype=anchor_latent.dtype,
+    )
+    low_freq_weight = _build_low_freq_anchor_weight(
+        mask,
+        decay_px=low_freq_anchor_decay_px,
+    ) if low_freq_target is not None else None
 
     return {
         "bbox": bbox,
         "mask": mask,
         "generation_weight": generation_weight,
+        "low_freq_target": low_freq_target,
+        "low_freq_weight": low_freq_weight,
         "sides": tuple(per_side_profiles.keys()),
         "present_positions": tuple(sorted(present_positions)),
         "profiles": per_side_profiles,
@@ -790,9 +914,13 @@ def apply_seam_anchor_correction(
     denoised: torch.Tensor,
     anchor_state: dict,
     effective_strength: float,
+    *,
+    low_freq_strength: float = 0.0,
 ) -> torch.Tensor:
-    if effective_strength <= 0.0 or (
-        not anchor_state.get("sides") and not anchor_state.get("extra_contributions")
+    if (effective_strength <= 0.0 and low_freq_strength <= 0.0) or (
+        not anchor_state.get("sides")
+        and not anchor_state.get("extra_contributions")
+        and anchor_state.get("low_freq_target") is None
     ):
         return denoised
 
@@ -831,21 +959,38 @@ def apply_seam_anchor_correction(
         merged = torch.where(total_weight > 1.0, merged * coverage, merged)
         corrected = denoised + merged * float(effective_strength)
     if not extra_contributions:
-        return corrected
-    weighted_sum = torch.zeros_like(corrected)
-    total_weight = torch.zeros(corrected.shape[0], 1, corrected.shape[-2], corrected.shape[-1], device=corrected.device, dtype=corrected.dtype)
-    for contribution in extra_contributions:
-        weight = _match_batch(contribution["weight"], corrected.shape[0]).to(device=corrected.device, dtype=corrected.dtype)
-        target_mean = _match_batch(contribution["mean"], corrected.shape[0]).to(device=corrected.device, dtype=corrected.dtype)
-        target_mean = _match_channels(target_mean, corrected.shape[1]).expand_as(corrected)
-        weighted_sum = weighted_sum + (target_mean - corrected) * weight
-        total_weight = total_weight + weight
-    if float(total_weight.max().item()) <= 0.0:
-        return corrected
-    coverage = total_weight.clamp(0.0, 1.0)
-    merged = torch.where(total_weight > 1.0, weighted_sum / total_weight.clamp_min(1e-8), weighted_sum)
-    merged = torch.where(total_weight > 1.0, merged * coverage, merged)
-    return corrected + merged * float(effective_strength)
+        guided = corrected
+    else:
+        weighted_sum = torch.zeros_like(corrected)
+        total_weight = torch.zeros(corrected.shape[0], 1, corrected.shape[-2], corrected.shape[-1], device=corrected.device, dtype=corrected.dtype)
+        for contribution in extra_contributions:
+            weight = _match_batch(contribution["weight"], corrected.shape[0]).to(device=corrected.device, dtype=corrected.dtype)
+            target_mean = _match_batch(contribution["mean"], corrected.shape[0]).to(device=corrected.device, dtype=corrected.dtype)
+            target_mean = _match_channels(target_mean, corrected.shape[1]).expand_as(corrected)
+            weighted_sum = weighted_sum + (target_mean - corrected) * weight
+            total_weight = total_weight + weight
+        if float(total_weight.max().item()) <= 0.0:
+            guided = corrected
+        else:
+            coverage = total_weight.clamp(0.0, 1.0)
+            merged = torch.where(total_weight > 1.0, weighted_sum / total_weight.clamp_min(1e-8), weighted_sum)
+            merged = torch.where(total_weight > 1.0, merged * coverage, merged)
+            guided = corrected + merged * float(effective_strength)
+
+    if low_freq_strength <= 0.0:
+        return guided
+    low_freq_target = anchor_state.get("low_freq_target")
+    low_freq_weight = anchor_state.get("low_freq_weight")
+    if low_freq_target is None or low_freq_weight is None:
+        return guided
+    target = _match_batch(low_freq_target, guided.shape[0]).to(device=guided.device, dtype=guided.dtype)
+    target = _match_channels(target, guided.shape[1])
+    weight = _match_batch(low_freq_weight, guided.shape[0]).to(device=guided.device, dtype=guided.dtype)
+    if target.shape[-2:] != guided.shape[-2:]:
+        target = F.interpolate(target, size=guided.shape[-2:], mode="bilinear", align_corners=False)
+    if weight.shape[-2:] != guided.shape[-2:]:
+        weight = F.interpolate(weight, size=guided.shape[-2:], mode="bilinear", align_corners=False)
+    return guided + (target - guided) * weight * float(low_freq_strength)
 
 
 def apply_seam_latent_guidance(
@@ -856,9 +1001,12 @@ def apply_seam_latent_guidance(
     mode: str = "mean_shift",
     boundary_only: bool = False,
     variance_limit: float = 2.0,
+    low_freq_strength: float = 0.0,
 ) -> torch.Tensor:
-    if effective_strength <= 0.0 or (
-        not anchor_state.get("sides") and not anchor_state.get("extra_contributions")
+    if (effective_strength <= 0.0 and low_freq_strength <= 0.0) or (
+        not anchor_state.get("sides")
+        and not anchor_state.get("extra_contributions")
+        and anchor_state.get("low_freq_target") is None
     ):
         return x
 
@@ -922,21 +1070,33 @@ def apply_seam_latent_guidance(
         merged = torch.where(total_weight > 1.0, weighted_sum / total_weight.clamp_min(1e-8), weighted_sum)
         merged = torch.where(total_weight > 1.0, merged * coverage, merged)
         guided = x + merged * float(effective_strength)
-    if not extra_contributions:
+    if extra_contributions:
+        weighted_sum = torch.zeros_like(guided)
+        total_weight = torch.zeros(guided.shape[0], 1, guided.shape[-2], guided.shape[-1], device=guided.device, dtype=guided.dtype)
+        for contribution in extra_contributions:
+            weight = _match_batch(contribution["weight"], guided.shape[0]).to(device=guided.device, dtype=guided.dtype)
+            if boundary_only:
+                weight = weight.clamp(0.0, 1.0).pow(2.0)
+            target_mean = _match_batch(contribution["mean"], guided.shape[0]).to(device=guided.device, dtype=guided.dtype)
+            target_mean = _match_channels(target_mean, guided.shape[1]).expand_as(guided)
+            weighted_sum = weighted_sum + (target_mean - guided) * weight
+            total_weight = total_weight + weight
+        if float(total_weight.max().item()) > 0.0:
+            coverage = total_weight.clamp(0.0, 1.0)
+            merged = torch.where(total_weight > 1.0, weighted_sum / total_weight.clamp_min(1e-8), weighted_sum)
+            merged = torch.where(total_weight > 1.0, merged * coverage, merged)
+            guided = guided + merged * float(effective_strength)
+    if low_freq_strength <= 0.0:
         return guided
-    weighted_sum = torch.zeros_like(guided)
-    total_weight = torch.zeros(guided.shape[0], 1, guided.shape[-2], guided.shape[-1], device=guided.device, dtype=guided.dtype)
-    for contribution in extra_contributions:
-        weight = _match_batch(contribution["weight"], guided.shape[0]).to(device=guided.device, dtype=guided.dtype)
-        if boundary_only:
-            weight = weight.clamp(0.0, 1.0).pow(2.0)
-        target_mean = _match_batch(contribution["mean"], guided.shape[0]).to(device=guided.device, dtype=guided.dtype)
-        target_mean = _match_channels(target_mean, guided.shape[1]).expand_as(guided)
-        weighted_sum = weighted_sum + (target_mean - guided) * weight
-        total_weight = total_weight + weight
-    if float(total_weight.max().item()) <= 0.0:
+    low_freq_target = anchor_state.get("low_freq_target")
+    low_freq_weight = anchor_state.get("low_freq_weight")
+    if low_freq_target is None or low_freq_weight is None:
         return guided
-    coverage = total_weight.clamp(0.0, 1.0)
-    merged = torch.where(total_weight > 1.0, weighted_sum / total_weight.clamp_min(1e-8), weighted_sum)
-    merged = torch.where(total_weight > 1.0, merged * coverage, merged)
-    return guided + merged * float(effective_strength)
+    target = _match_batch(low_freq_target, guided.shape[0]).to(device=guided.device, dtype=guided.dtype)
+    target = _match_channels(target, guided.shape[1])
+    weight = _match_batch(low_freq_weight, guided.shape[0]).to(device=guided.device, dtype=guided.dtype)
+    if target.shape[-2:] != guided.shape[-2:]:
+        target = F.interpolate(target, size=guided.shape[-2:], mode="bilinear", align_corners=False)
+    if weight.shape[-2:] != guided.shape[-2:]:
+        weight = F.interpolate(weight, size=guided.shape[-2:], mode="bilinear", align_corners=False)
+    return guided + (target - guided) * weight * float(low_freq_strength)
