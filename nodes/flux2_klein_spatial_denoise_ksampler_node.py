@@ -7,6 +7,7 @@ from tqdm.auto import trange
 
 try:
     import comfy.model_management
+    import comfy.sampler_helpers
     import comfy.samplers
     import comfy.utils
     import latent_preview
@@ -201,25 +202,24 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
 
         # pre_run sets real_model.current_patcher = model (required by calc_cond_batch)
         model.pre_run()
+
+        # convert_cond transforms [[tensor, meta], ...] → [{cross_attn, model_conds, uuid, ...}, ...]
+        # This is required by process_conds (same as CFGGuider.inner_set_conds does internally).
+        g_embed = float(guidance_embed) if has_guidance_embed else None
+        conds_converted = {
+            "positive": comfy.sampler_helpers.convert_cond(
+                _clone_conditioning(positive, guidance_embed=g_embed)
+            ),
+        }
+        if negative is not None:
+            conds_converted["negative"] = comfy.sampler_helpers.convert_cond(
+                _clone_conditioning(negative, guidance_embed=g_embed)
+            )
+
         processed = comfy.samplers.process_conds(
             real_model,
             x,
-            {
-                "positive": _clone_conditioning(
-                    positive,
-                    guidance_embed=float(guidance_embed) if has_guidance_embed else None,
-                ),
-                **(
-                    {
-                        "negative": _clone_conditioning(
-                            negative,
-                            guidance_embed=float(guidance_embed) if has_guidance_embed else None,
-                        )
-                    }
-                    if negative is not None
-                    else {}
-                ),
-            },
+            conds_converted,
             device,
             latent_image=latent_device,
             seed=seed,
