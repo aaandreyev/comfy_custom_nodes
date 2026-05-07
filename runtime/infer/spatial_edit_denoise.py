@@ -383,7 +383,12 @@ def build_local_denoise_state(
 
             if float(weight.max().item()) <= 0.0:
                 continue
-            value = band_denoise_max - (band_denoise_max - band_denoise_min) * weight
+            # value MUST be alpha-independent to keep target linear in alpha.
+            # If value depended on weight (e.g. band_max - (band_max-band_min)*weight),
+            # the final blend `base*(1-α) + value*α` becomes quadratic (1 - α²)
+            # — visually compressing the entire gradient into the band's middle third.
+            # Use band_min as a constant; band_max applies as a ceiling on base_map below.
+            value = torch.full_like(weight, float(band_denoise_min))
             zone_weights.append(weight)
             zone_values.append(value)
 
@@ -400,9 +405,15 @@ def build_local_denoise_state(
                 local_value = (value_stack * alpha_stack).sum(dim=0) / alpha_stack.sum(dim=0).clamp_min(1e-8)
             else:
                 raise ValueError(f"unsupported merge_mode: {merge_mode}")
+            # Apply band_max as a ceiling on base_map only within the band region (alpha > 0).
+            # This keeps the gradient linear in α: target = base_capped*(1-α) + band_min*α.
+            base_capped = torch.minimum(
+                base_map,
+                torch.full_like(base_map, float(band_denoise_max)),
+            )
             target_map = torch.where(
                 alpha > 0.0,
-                base_map * (1.0 - alpha) + local_value * alpha,
+                base_capped * (1.0 - alpha) + local_value * alpha,
                 base_map,
             ).clamp(0.0, 1.0)
 
