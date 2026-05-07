@@ -6,9 +6,6 @@ import torch
 import torch.nn.functional as F
 
 from ..strip_ops import mask_bbox
-from .merge_bands import build_seam_local_weight_map
-
-
 Position = str
 
 CORNER_POSITIONS: tuple[Position, ...] = ("nw", "ne", "sw", "se")
@@ -102,103 +99,107 @@ def _build_band_alpha_from_distance(
     return 0.5 * (1.0 - torch.cos(math.pi * alpha.clamp(0.0, 1.0)))
 
 
-def _corner_weight(
-    mask: torch.Tensor,
-    bbox: tuple[int, int, int, int],
-    corner: Position,
+def _shift_mask(mask: torch.Tensor, *, dx: int, dy: int) -> torch.Tensor:
+    _, _, height, width = mask.shape
+    out = torch.zeros_like(mask)
+    src_x0 = max(-dx, 0)
+    src_x1 = min(width - dx, width)
+    src_y0 = max(-dy, 0)
+    src_y1 = min(height - dy, height)
+    dst_x0 = max(dx, 0)
+    dst_x1 = dst_x0 + max(src_x1 - src_x0, 0)
+    dst_y0 = max(dy, 0)
+    dst_y1 = dst_y0 + max(src_y1 - src_y0, 0)
+    if src_x1 <= src_x0 or src_y1 <= src_y0:
+        return out
+    out[:, :, dst_y0:dst_y1, dst_x0:dst_x1] = mask[:, :, src_y0:src_y1, src_x0:src_x1]
+    return out
+
+
+def _distance_alpha(
+    distance: int,
     *,
     band_width: int,
     band_gradient_px: int,
-) -> torch.Tensor:
-    _, _, height, width = mask.shape
-    x0, y0, x1, y1 = [int(x) for x in bbox]
-    device, dtype = mask.device, mask.dtype
-    yy = torch.arange(height, device=device, dtype=dtype).view(1, 1, height, 1)
-    xx = torch.arange(width, device=device, dtype=dtype).view(1, 1, 1, width)
-
-    if corner == "nw":
-        dx = (xx - float(x0)).clamp_min(0.0)
-        dy = (yy - float(y0)).clamp_min(0.0)
-    elif corner == "ne":
-        dx = (float(x1 - 1) - xx).clamp_min(0.0)
-        dy = (yy - float(y0)).clamp_min(0.0)
-    elif corner == "sw":
-        dx = (xx - float(x0)).clamp_min(0.0)
-        dy = (float(y1 - 1) - yy).clamp_min(0.0)
-    elif corner == "se":
-        dx = (float(x1 - 1) - xx).clamp_min(0.0)
-        dy = (float(y1 - 1) - yy).clamp_min(0.0)
-    else:
-        raise ValueError(f"unsupported corner: {corner}")
-
-    distance = torch.maximum(dx, dy)
-    return _build_band_alpha_from_distance(
-        distance,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> float:
+    value = _build_band_alpha_from_distance(
+        torch.tensor(float(distance), device=device, dtype=dtype),
         band_width=int(band_width),
         band_gradient_px=int(band_gradient_px),
-    ) * mask
+    )
+    return float(value.item())
 
 
 def _zone_weight(
     mask: torch.Tensor,
-    bbox: tuple[int, int, int, int],
+    source: torch.Tensor,
     position: Position,
     *,
     band_width: int,
     band_gradient_px: int,
-    active_sides: set[str],
 ) -> torch.Tensor:
-    if position == "n":
-        return build_seam_local_weight_map(
-            mask,
-            bbox,
-            "top",
-            int(band_width),
-            flat_top_px=max(int(band_width) - max(int(band_gradient_px), 0), 0),
-            blend_falloff_px=int(band_gradient_px),
-            power=1.0,
-            active_sides=active_sides,
-        )
-    if position == "s":
-        return build_seam_local_weight_map(
-            mask,
-            bbox,
-            "bottom",
-            int(band_width),
-            flat_top_px=max(int(band_width) - max(int(band_gradient_px), 0), 0),
-            blend_falloff_px=int(band_gradient_px),
-            power=1.0,
-            active_sides=active_sides,
-        )
+    if band_width <= 0:
+        return torch.zeros_like(mask)
+
+    _, _, _, _ = mask.shape
+    device, dtype = mask.device, mask.dtype
+    projected = torch.zeros_like(mask)
+    max_distance = int(max(band_width, 0))
+
     if position == "w":
-        return build_seam_local_weight_map(
-            mask,
-            bbox,
-            "left",
-            int(band_width),
-            flat_top_px=max(int(band_width) - max(int(band_gradient_px), 0), 0),
-            blend_falloff_px=int(band_gradient_px),
-            power=1.0,
-            active_sides=active_sides,
+        offsets = [((distance + 1, 0), distance) for distance in range(max_distance)]
+    elif position == "e":
+        offsets = [((-(distance + 1), 0), distance) for distance in range(max_distance)]
+    elif position == "n":
+        offsets = [((0, distance + 1), distance) for distance in range(max_distance)]
+    elif position == "s":
+        offsets = [((0, -(distance + 1)), distance) for distance in range(max_distance)]
+    elif position == "nw":
+        offsets = [
+            ((dx, dy), max(dx - 1, dy - 1))
+            for dx in range(1, max_distance + 1)
+            for dy in range(1, max_distance + 1)
+            if max(dx, dy) <= max_distance
+        ]
+    elif position == "ne":
+        offsets = [
+            ((-dx, dy), max(dx - 1, dy - 1))
+            for dx in range(1, max_distance + 1)
+            for dy in range(1, max_distance + 1)
+            if max(dx, dy) <= max_distance
+        ]
+    elif position == "sw":
+        offsets = [
+            ((dx, -dy), max(dx - 1, dy - 1))
+            for dx in range(1, max_distance + 1)
+            for dy in range(1, max_distance + 1)
+            if max(dx, dy) <= max_distance
+        ]
+    elif position == "se":
+        offsets = [
+            ((-dx, -dy), max(dx - 1, dy - 1))
+            for dx in range(1, max_distance + 1)
+            for dy in range(1, max_distance + 1)
+            if max(dx, dy) <= max_distance
+        ]
+    else:
+        raise ValueError(f"unsupported position: {position}")
+
+    for (dx, dy), distance in offsets:
+        alpha = _distance_alpha(
+            distance,
+            band_width=int(band_width),
+            band_gradient_px=int(band_gradient_px),
+            device=device,
+            dtype=dtype,
         )
-    if position == "e":
-        return build_seam_local_weight_map(
-            mask,
-            bbox,
-            "right",
-            int(band_width),
-            flat_top_px=max(int(band_width) - max(int(band_gradient_px), 0), 0),
-            blend_falloff_px=int(band_gradient_px),
-            power=1.0,
-            active_sides=active_sides,
-        )
-    return _corner_weight(
-        mask,
-        bbox,
-        position,
-        band_width=int(band_width),
-        band_gradient_px=int(band_gradient_px),
-    )
+        if alpha <= 0.0:
+            continue
+        shifted = _shift_mask(source, dx=dx, dy=dy)
+        projected = torch.maximum(projected, shifted * alpha)
+    return projected * mask
 
 
 def build_local_denoise_state(
@@ -265,15 +266,21 @@ def build_local_denoise_state(
             per_sample.append({"bbox": bbox, "present_positions": tuple(sorted(present_positions))})
             continue
 
-        active_sides = {
-            side
-            for side, pos in (("left", "w"), ("right", "e"), ("top", "n"), ("bottom", "s"))
-            if pos in present_positions
-        }
         effective_positions = set(present_positions)
         if not effective_positions:
-            effective_positions = set(ALL_POSITIONS)
-            active_sides = {"left", "right", "top", "bottom"}
+            if normalized_topology is None:
+                effective_positions = set(ALL_POSITIONS)
+            else:
+                target_map = base_map.clamp(0.0, 1.0)
+                maps.append(target_map)
+                per_sample.append(
+                    {
+                        "bbox": bbox,
+                        "present_positions": tuple(sorted(present_positions)),
+                        "uniform_fallback": False,
+                    }
+                )
+                continue
 
         if int(band_width) >= max(bbox_w, bbox_h):
             target_map = torch.where(
@@ -294,13 +301,24 @@ def build_local_denoise_state(
         zone_weights = []
         zone_values = []
         for position in sorted(effective_positions):
+            zone = position_zone_mask(sample_mask.shape[-2:], bbox, position, device=sample_mask.device, dtype=sample_mask.dtype)
+            if normalized_topology is None:
+                source = zone
+            else:
+                topo_sample = (
+                    normalized_topology[idx : idx + 1]
+                    if normalized_topology.shape[0] > 1
+                    else normalized_topology
+                )
+                source = topo_sample * zone
+            if float(source.max().item()) <= 0.0:
+                continue
             weight = _zone_weight(
                 sample_mask,
-                bbox,
+                source,
                 position,
                 band_width=int(band_width),
                 band_gradient_px=int(band_gradient_px),
-                active_sides=active_sides,
             ).clamp(0.0, 1.0)
             if float(weight.max().item()) <= 0.0:
                 continue
