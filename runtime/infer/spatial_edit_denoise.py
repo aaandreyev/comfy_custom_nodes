@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
 
 from ..strip_ops import mask_bbox
-Position = str
+
+Position = Literal["nw", "n", "ne", "w", "e", "sw", "s", "se"]
 
 CORNER_POSITIONS: tuple[Position, ...] = ("nw", "ne", "sw", "se")
 SIDE_POSITIONS: tuple[Position, ...] = ("n", "s", "w", "e")
@@ -20,6 +22,11 @@ def normalize_mask(mask: torch.Tensor, reference_shape: tuple[int, int]) -> torc
         mask = mask.unsqueeze(1)
     elif mask.ndim != 4:
         raise ValueError("expected mask with shape [H,W], [B,H,W], or [B,1,H,W]")
+    if mask.shape[1] != 1:
+        raise ValueError(
+            f"mask must have exactly 1 channel, got shape {list(mask.shape)}; "
+            "pass a single-channel [B,1,H,W] tensor"
+        )
     mask = mask.float()
     if mask.shape[-2:] != reference_shape:
         mask = F.interpolate(mask, size=reference_shape, mode="nearest")
@@ -172,22 +179,49 @@ def _zone_weight(
 ) -> torch.Tensor:
     """
     Projection-based weight for topology-weighted source.
-    O(band_width) for sides, O(band_width²) for corners.
-    Alphas are precomputed in a single vectorized call before the shift loop.
+    O(band_width) for all positions: corners use max_pool2d d-level iteration,
+    sides use a 1-D shift loop.
     """
     if band_width <= 0:
         return torch.zeros_like(mask)
 
     device, dtype = mask.device, mask.dtype
+    _, _, H, W = mask.shape
     max_distance = band_width
 
-    # Преcompute all alphas in one vectorized call (eliminates N scalar tensor creations)
     dist_range = torch.arange(max_distance, device=device, dtype=dtype)
     alpha_vec = _build_band_alpha_from_distance(
         dist_range, band_width=band_width, band_gradient_px=band_gradient_px
     )
     alpha_list = alpha_vec.tolist()
 
+    if position in CORNER_POSITIONS:
+        # O(band_width) via incremental max_pool2d per Chebyshev level d.
+        # Proved correct: max_d { alpha(d) * pool_{d+1}(source) } equals the
+        # exact per-pixel max over all (dx,dy) shifts with Chebyshev distance d+1
+        # and the corresponding alpha(d) weight.
+        source_f = source.float()
+        projected = torch.zeros_like(mask)
+        for d, a in enumerate(alpha_list):
+            if a <= 0.0:
+                break
+            ks = d + 1
+            if position == "nw":
+                padded = F.pad(source_f, (ks, 0, ks, 0))
+                pool = F.max_pool2d(padded, kernel_size=(ks, ks), stride=1)[:, :, :H, :W]
+            elif position == "ne":
+                padded = F.pad(source_f, (0, ks, ks, 0))
+                pool = F.max_pool2d(padded, kernel_size=(ks, ks), stride=1)[:, :, :H, 1 : W + 1]
+            elif position == "sw":
+                padded = F.pad(source_f, (ks, 0, 0, ks))
+                pool = F.max_pool2d(padded, kernel_size=(ks, ks), stride=1)[:, :, 1 : H + 1, :W]
+            else:  # "se"
+                padded = F.pad(source_f, (0, ks, 0, ks))
+                pool = F.max_pool2d(padded, kernel_size=(ks, ks), stride=1)[:, :, 1 : H + 1, 1 : W + 1]
+            projected = torch.maximum(projected, pool.to(dtype) * a)
+        return projected * mask
+
+    # Sides: O(band_width) shift loop
     if position == "w":
         offsets = [((d + 1, 0), alpha_list[d]) for d in range(max_distance)]
     elif position == "e":
@@ -196,34 +230,6 @@ def _zone_weight(
         offsets = [((0, d + 1), alpha_list[d]) for d in range(max_distance)]
     elif position == "s":
         offsets = [((0, -(d + 1)), alpha_list[d]) for d in range(max_distance)]
-    elif position == "nw":
-        offsets = [
-            ((dx, dy), alpha_list[max(dx - 1, dy - 1)])
-            for dx in range(1, max_distance + 1)
-            for dy in range(1, max_distance + 1)
-            if max(dx, dy) <= max_distance
-        ]
-    elif position == "ne":
-        offsets = [
-            ((-dx, dy), alpha_list[max(dx - 1, dy - 1)])
-            for dx in range(1, max_distance + 1)
-            for dy in range(1, max_distance + 1)
-            if max(dx, dy) <= max_distance
-        ]
-    elif position == "sw":
-        offsets = [
-            ((dx, -dy), alpha_list[max(dx - 1, dy - 1)])
-            for dx in range(1, max_distance + 1)
-            for dy in range(1, max_distance + 1)
-            if max(dx, dy) <= max_distance
-        ]
-    elif position == "se":
-        offsets = [
-            ((-dx, -dy), alpha_list[max(dx - 1, dy - 1)])
-            for dx in range(1, max_distance + 1)
-            for dy in range(1, max_distance + 1)
-            if max(dx, dy) <= max_distance
-        ]
     else:
         raise ValueError(f"unsupported position: {position}")
 
@@ -306,7 +312,7 @@ def build_local_denoise_state(
         if not local_denoise_enabled:
             target_map = base_map.clamp(0.0, 1.0)
             maps.append(target_map)
-            per_sample.append({"bbox": bbox, "present_positions": tuple(sorted(present_positions))})
+            per_sample.append({"bbox": bbox, "present_positions": tuple(sorted(present_positions)), "uniform_fallback": False})
             continue
 
         effective_positions = set(present_positions)
@@ -326,11 +332,12 @@ def build_local_denoise_state(
                 continue
 
         # When band covers the entire mask there is no room for a gradient;
-        # treat the whole mask as "center" and apply band_denoise_max uniformly.
+        # treat the whole mask as "center" and apply min(global_denoise, band_denoise_max) uniformly.
         if int(band_width) >= max(bbox_w, bbox_h):
+            uniform_value = min(float(global_denoise), float(band_denoise_max))
             target_map = torch.where(
                 sample_mask > 0.5,
-                torch.full_like(sample_mask, band_denoise_max),
+                torch.full_like(sample_mask, uniform_value),
                 base_map,
             ).clamp(0.0, 1.0)
             maps.append(target_map)

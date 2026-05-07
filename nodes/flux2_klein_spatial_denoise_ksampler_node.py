@@ -60,10 +60,6 @@ def _clone_conditioning(conditioning, *, guidance_embed: float | None):
     return cloned
 
 
-def _can_use_comfy_conditioning_pipeline(model) -> bool:
-    return hasattr(model, "model_sampling")
-
-
 class Flux2KleinSpatialDenoiseKSamplerNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -99,7 +95,7 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
     RETURN_TYPES = ("LATENT",)
     RETURN_NAMES = ("latent",)
     FUNCTION = "sample"
-    CATEGORY = "seam"
+    CATEGORY = "flux2_klein"
 
     def sample(
         self,
@@ -128,15 +124,19 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
     ):
         if comfy is None or latent_preview is None:
             raise ModuleNotFoundError("Flux2KleinSpatialDenoiseKSampler requires ComfyUI runtime modules")
-        if float(band_denoise_min) > float(band_denoise_max):
-            raise ValueError("band_denoise_min must be less than or equal to band_denoise_max")
 
         device = comfy.model_management.get_torch_device()
         latent = latent_image["samples"]
         B, _, H, W = latent.shape
 
         mask_t = normalize_mask(mask, (H, W))
-        # П3: topology_mask is normalized inside build_local_denoise_state — no pre-normalization needed
+        # GAP-2: mask batch must be 1 (broadcast) or exactly match latent batch
+        if mask_t.shape[0] not in (1, B):
+            raise ValueError(
+                f"mask batch size {mask_t.shape[0]} is incompatible with latent batch size {B}; "
+                "mask must have batch size 1 or exactly match the latent batch size"
+            )
+
         denoise_state = build_local_denoise_state(
             mask_t,
             global_denoise=float(denoise),
@@ -175,78 +175,59 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
         )
         start_sigma = float(schedule[0]) if schedule else 0.0
 
+        # BUG-1: Scale per-pixel denoise fractions into schedule sigma space.
+        # target_denoise_map ∈ [0, effective_denoise]; sigma_map ∈ [0, start_sigma].
+        # Without this, local-denoise pixels are initialized at the wrong noise level
+        # relative to the time-shifted schedule start (e.g. effective_denoise=0.5 maps
+        # to start_sigma≈0.76 after time-shift, so raw target values under-noise).
+        sigma_scale = start_sigma / effective_denoise if effective_denoise > 1e-6 else 1.0
+        sigma_map = (target_denoise_map * sigma_scale).clamp(0.0, 1.0)
+
         generator = torch.Generator(device="cpu").manual_seed(seed)
         noise = torch.randn(latent.shape, generator=generator, dtype=torch.float32, device="cpu")
         if schedule and start_sigma > 1e-6:
-            if not bool(local_denoise_enabled):
-                x = (1.0 - start_sigma) * latent.float() + start_sigma * noise
-            else:
-                x = (1.0 - target_denoise_map) * latent.float() + target_denoise_map * noise
+            x = (1.0 - sigma_map) * latent.float() + sigma_map * noise
         else:
             x = latent.float().clone()
         x = x.to(device=device, dtype=model_dtype)
         latent_device = latent.to(device=device, dtype=model_dtype)
         noise_device = noise.to(device=device, dtype=model_dtype)
-        target_map_device = target_denoise_map.to(device=device, dtype=model_dtype)
+        sigma_map_device = sigma_map.to(device=device, dtype=model_dtype)
 
         use_cfg = cfg > 1.0 and negative is not None
         has_guidance_embed = getattr(diffusion_model.params, "guidance_embed", False)
-        use_comfy_cond_pipeline = _can_use_comfy_conditioning_pipeline(model)
-        positive_conds = None
-        negative_conds = None
         model_options = model.model_options
-        guidance_vec = None
-        if has_guidance_embed:
-            guidance_vec = torch.full((B,), guidance_embed, device=device, dtype=model_dtype)
 
-        neg_cond = None
-        ref_latents = None
-        if use_comfy_cond_pipeline:
-            processed = comfy.samplers.process_conds(
-                model,
-                x,
-                {
-                    "positive": _clone_conditioning(
-                        positive,
-                        guidance_embed=float(guidance_embed) if has_guidance_embed else None,
-                    ),
-                    **(
-                        {
-                            "negative": _clone_conditioning(
-                                negative,
-                                guidance_embed=float(guidance_embed) if has_guidance_embed else None,
-                            )
-                        }
-                        if negative is not None else {}
-                    ),
-                },
-                device,
-                latent_image=latent_device,
-                seed=seed,
-            )
-            positive_conds = processed["positive"]
-            negative_conds = processed.get("negative")
-        else:
-            cond = positive[0][0].to(device=device, dtype=model_dtype)
-            if cond.shape[0] != B:
-                cond = cond[:1].expand(B, -1, -1)
-            if use_cfg:
-                neg_cond = negative[0][0].to(device=device, dtype=model_dtype)
-                if neg_cond.shape[0] != B:
-                    neg_cond = neg_cond[:1].expand(B, -1, -1)
-            cond_meta = positive[0][1] if len(positive[0]) > 1 else {}
-            for key in ("ref_latents", "reference_latents", "concat_latent_image"):
-                if key in cond_meta:
-                    ref_val = cond_meta[key]
-                    if isinstance(ref_val, torch.Tensor):
-                        ref_latents = [ref_val.to(device=device, dtype=model_dtype)]
-                    elif isinstance(ref_val, list):
-                        ref_latents = [r.to(device=device, dtype=model_dtype) for r in ref_val]
-                    break
+        processed = comfy.samplers.process_conds(
+            model,
+            x,
+            {
+                "positive": _clone_conditioning(
+                    positive,
+                    guidance_embed=float(guidance_embed) if has_guidance_embed else None,
+                ),
+                **(
+                    {
+                        "negative": _clone_conditioning(
+                            negative,
+                            guidance_embed=float(guidance_embed) if has_guidance_embed else None,
+                        )
+                    }
+                    if negative is not None
+                    else {}
+                ),
+            },
+            device,
+            latent_image=latent_device,
+            seed=seed,
+        )
+        positive_conds = processed["positive"]
+        negative_conds = processed.get("negative")
 
         total_steps = max(len(schedule) - 1, 0)
-        pbar = comfy.utils.ProgressBar(total_steps)
-        preview_callback = latent_preview.prepare_callback(model, total_steps)
+        # M-3: guard against 0-step degenerate case (denoise=0 or empty schedule)
+        pbar = comfy.utils.ProgressBar(total_steps) if total_steps > 0 else None
+        preview_callback = latent_preview.prepare_callback(model, total_steps) if total_steps > 0 else None
 
         if debug:
             fallback_count = sum(
@@ -255,7 +236,8 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
             print(
                 f"[Flux2KleinSpatialDenoiseKSampler] steps={total_steps} "
                 f"denoise={denoise:.4f} effective_denoise={effective_denoise:.4f} "
-                f"start_sigma={start_sigma:.4f} local={bool(local_denoise_enabled)} "
+                f"start_sigma={start_sigma:.4f} sigma_scale={sigma_scale:.4f} "
+                f"local={bool(local_denoise_enabled)} "
                 f"band_width={int(band_width)} gradient={int(band_gradient_px)} "
                 f"band_min={float(band_denoise_min):.3f} band_max={float(band_denoise_max):.3f} "
                 f"merge={merge_mode} present={','.join(denoise_state.get('present_positions', ())) or 'auto'}"
@@ -269,49 +251,24 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
                 t_curr = float(schedule[i])
                 t_prev = float(schedule[i + 1])
                 t_vec = torch.full((B,), t_curr, device=device, dtype=model_dtype)
-                if use_comfy_cond_pipeline:
-                    if use_cfg:
-                        pred, pred_uncond = comfy.samplers.calc_cond_batch(
-                            model,
-                            [positive_conds, negative_conds],
-                            x,
-                            t_vec,
-                            model_options,
-                        )
-                        pred = pred_uncond + cfg * (pred - pred_uncond)
-                    else:
-                        (pred,) = comfy.samplers.calc_cond_batch(
-                            model,
-                            [positive_conds],
-                            x,
-                            t_vec,
-                            model_options,
-                        )
-                else:
-                    transformer_options = model.model_options.get("transformer_options", {}).copy()
-                    transformer_options["sigmas"] = t_vec
-                    pred = diffusion_model.forward(
+
+                if use_cfg:
+                    pred, pred_uncond = comfy.samplers.calc_cond_batch(
+                        model,
+                        [positive_conds, negative_conds],
                         x,
                         t_vec,
-                        cond,
-                        y=None,
-                        guidance=guidance_vec,
-                        ref_latents=ref_latents,
-                        control=None,
-                        transformer_options=transformer_options,
+                        model_options,
                     )
-                    if use_cfg:
-                        pred_uncond = diffusion_model.forward(
-                            x,
-                            t_vec,
-                            neg_cond,
-                            y=None,
-                            guidance=guidance_vec,
-                            ref_latents=ref_latents,
-                            control=None,
-                            transformer_options=transformer_options,
-                        )
-                        pred = pred_uncond + cfg * (pred - pred_uncond)
+                    pred = pred_uncond + cfg * (pred - pred_uncond)
+                else:
+                    (pred,) = comfy.samplers.calc_cond_batch(
+                        model,
+                        [positive_conds],
+                        x,
+                        t_vec,
+                        model_options,
+                    )
 
                 if preview_callback is not None:
                     x0_est = (x - t_curr * pred) if t_curr > 1e-6 else x
@@ -322,9 +279,10 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
                     x,
                     latent_device,
                     noise_device,
-                    target_map_device,
+                    sigma_map_device,
                     t_prev,
                 )
-                pbar.update(1)
+                if pbar is not None:
+                    pbar.update(1)
 
         return ({"samples": x.cpu().float()},)
