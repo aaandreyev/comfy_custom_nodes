@@ -165,7 +165,7 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
         full_schedule = _get_schedule(steps, image_seq_len, base_shift=base_shift, max_shift=max_shift)
         schedule = build_continuous_schedule(
             full_schedule,
-            max_start_denoise,
+            float(denoise),
             schedule_builder=lambda total_steps: _get_schedule(
                 total_steps,
                 image_seq_len,
@@ -173,12 +173,13 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
                 max_shift=max_shift,
             ),
         )
+        start_sigma = float(schedule[0]) if schedule else 0.0
 
         generator = torch.Generator(device="cpu").manual_seed(seed)
         noise = torch.randn(latent.shape, generator=generator, dtype=torch.float32, device="cpu")
-        if schedule and schedule[0] > 1e-6:
+        if schedule and start_sigma > 1e-6:
             if not bool(local_denoise_enabled):
-                x = (1.0 - float(schedule[0])) * latent.float() + float(schedule[0]) * noise
+                x = (1.0 - start_sigma) * latent.float() + start_sigma * noise
             else:
                 x = (1.0 - target_denoise_map) * latent.float() + target_denoise_map * noise
         else:
@@ -250,7 +251,7 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
         if debug:
             print(
                 f"[Flux2KleinSpatialDenoiseKSampler] steps={total_steps} denoise={denoise:.4f} "
-                f"start_denoise={max_start_denoise:.4f} local={bool(local_denoise_enabled)} "
+                f"start_denoise={start_sigma:.4f} local={bool(local_denoise_enabled)} "
                 f"band_width={int(band_width)} gradient={int(band_gradient_px)} "
                 f"band_min={float(band_denoise_min):.3f} band_max={float(band_denoise_max):.3f} "
                 f"merge={merge_mode} present={','.join(denoise_state.get('present_positions', ())) or 'auto'}"

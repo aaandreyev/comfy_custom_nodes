@@ -369,7 +369,8 @@ def build_continuous_schedule(
             raise ValueError("schedule_builder is required when denoise expands the schedule")
         dense_schedule = [float(x) for x in schedule_builder(total_steps_int)]
 
-    positions = torch.linspace(0.0, total_steps_float, steps + 1, dtype=torch.float64)
+    start_offset = max(total_steps_float - float(steps), 0.0)
+    positions = torch.linspace(start_offset, total_steps_float, steps + 1, dtype=torch.float64)
     out: list[float] = []
     for pos in positions.tolist():
         if pos >= total_steps_int:
