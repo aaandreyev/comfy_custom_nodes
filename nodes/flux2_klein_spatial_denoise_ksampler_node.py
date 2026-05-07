@@ -138,24 +138,30 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
                 "mask must have batch size 1 or exactly match the latent batch size"
             )
 
+        comfy.model_management.load_models_gpu([model])
+        real_model = model.model  # BaseModel (Flux2); required by process_conds / calc_cond_batch
+        diffusion_model = real_model.diffusion_model
+        model_dtype = diffusion_model.dtype
+
+        # band_width / band_gradient_px are user-facing in IMAGE pixels.
+        # Internal mask/bbox lives in latent space → convert via VAE downscale.
+        vae_downscale = int(getattr(getattr(real_model, "latent_format", None), "spacial_downscale_ratio", 16))
+        band_width_latent = max(1, int(round(float(band_width) / vae_downscale)))
+        band_gradient_latent = max(0, int(round(float(band_gradient_px) / vae_downscale)))
+
         denoise_state = build_local_denoise_state(
             mask_t,
             global_denoise=float(denoise),
             topology_mask=topology_mask,
             local_denoise_enabled=bool(local_denoise_enabled),
-            band_width=int(band_width),
-            band_gradient_px=int(band_gradient_px),
+            band_width=band_width_latent,
+            band_gradient_px=band_gradient_latent,
             band_denoise_min=float(band_denoise_min),
             band_denoise_max=float(band_denoise_max),
             merge_mode=str(merge_mode),
             topology_threshold=float(topology_threshold),
             preserve_outside_latent=bool(preserve_outside_latent),
         )
-
-        comfy.model_management.load_models_gpu([model])
-        real_model = model.model  # BaseModel (Flux2); required by process_conds / calc_cond_batch
-        diffusion_model = real_model.diffusion_model
-        model_dtype = diffusion_model.dtype
 
         patch_size = diffusion_model.patch_size
         h_tokens = H // patch_size
@@ -236,12 +242,22 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
             fallback_count = sum(
                 1 for s in denoise_state.get("per_sample", []) if s.get("uniform_fallback")
             )
+            bbox_str = ""
+            for s in denoise_state.get("per_sample", []):
+                bbox = s.get("bbox")
+                if bbox is not None:
+                    x0, y0, x1, y1 = bbox
+                    bw_lat, bh_lat = x1 - x0, y1 - y0
+                    bbox_str = f" bbox={bw_lat*vae_downscale}x{bh_lat*vae_downscale}px({bw_lat}x{bh_lat}lat)"
+                    break
             print(
                 f"[Flux2KleinSpatialDenoiseKSampler] steps={total_steps} "
                 f"denoise={denoise:.4f} effective_denoise={effective_denoise:.4f} "
                 f"start_sigma={start_sigma:.4f} sigma_scale={sigma_scale:.4f} "
                 f"local={bool(local_denoise_enabled)} "
-                f"band_width={int(band_width)} gradient={int(band_gradient_px)} "
+                f"band_width={int(band_width)}px({band_width_latent}lat) "
+                f"gradient={int(band_gradient_px)}px({band_gradient_latent}lat) "
+                f"vae_ds={vae_downscale}{bbox_str} "
                 f"band_min={float(band_denoise_min):.3f} band_max={float(band_denoise_max):.3f} "
                 f"merge={merge_mode} present={','.join(denoise_state.get('present_positions', ())) or 'auto'}"
                 + (f" uniform_fallback={fallback_count}/{B}" if fallback_count else "")

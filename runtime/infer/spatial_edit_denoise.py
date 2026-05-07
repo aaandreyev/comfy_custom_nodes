@@ -471,9 +471,18 @@ def apply_spatial_denoise_preservation(
 ) -> torch.Tensor:
     t_next = float(t_next)
     target = target_denoise_map.to(device=x.device, dtype=x.dtype).clamp(0.0, 1.0)
+    latent_dev = latent.to(device=x.device, dtype=x.dtype)
     if t_next <= 1e-6:
-        return torch.where(target > 1e-6, x, latent.to(device=x.device, dtype=x.dtype))
+        # Final step: blend x ↔ latent by normalized sigma_map so the band
+        # gradient remains visible in the output (otherwise any sigma_map > 0
+        # snaps to x and only the bare edge collapses to latent → hard step).
+        max_target = float(target.max().item())
+        if max_target > 1e-6:
+            blend = (target / max_target).clamp(0.0, 1.0)
+        else:
+            blend = torch.zeros_like(target)
+        return blend * x + (1.0 - blend) * latent_dev
     allowed = torch.minimum(target, torch.full_like(target, t_next))
     freedom = (allowed / t_next).clamp(0.0, 1.0)
-    ref_x = (1.0 - allowed) * latent + allowed * noise
+    ref_x = (1.0 - allowed) * latent_dev + allowed * noise
     return x * freedom + ref_x * (1.0 - freedom)
