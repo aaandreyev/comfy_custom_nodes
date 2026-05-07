@@ -6,6 +6,11 @@ from .seam_latent_anchor_node import SeamLatentAnchorNode
 from .seam_harmonizer_node import SeamHarmonizerV3Node
 
 try:
+    from .flux2_klein_spatial_denoise_ksampler_node import Flux2KleinSpatialDenoiseKSamplerNode
+except ModuleNotFoundError:  # Optional in bare test environments without ComfyUI.
+    Flux2KleinSpatialDenoiseKSamplerNode = None
+
+try:
     from .seam_guided_ksampler_node import SeamGuidedKSamplerNode
 except ModuleNotFoundError:  # Optional in bare test environments without ComfyUI.
     SeamGuidedKSamplerNode = None
@@ -18,6 +23,9 @@ __all__ = [
     "SeamLatentAnchorNode",
     "SeamHarmonizerV3Node",
 ]
+
+if Flux2KleinSpatialDenoiseKSamplerNode is not None:
+    __all__.append("Flux2KleinSpatialDenoiseKSamplerNode")
 
 if SeamGuidedKSamplerNode is not None:
     __all__.append("SeamGuidedKSamplerNode")
