@@ -345,24 +345,44 @@ def build_local_denoise_state(
     }
 
 
-def build_continuous_schedule(full_schedule: list[float], denoise: float) -> list[float]:
+def build_continuous_schedule(
+    full_schedule: list[float],
+    denoise: float,
+    *,
+    schedule_builder=None,
+) -> list[float]:
     if not full_schedule:
         return []
     denoise = float(max(0.0, min(1.0, denoise)))
-    first = float(full_schedule[0])
-    last = float(full_schedule[-1])
-    if denoise >= first - 1e-8:
+    steps = max(len(full_schedule) - 1, 0)
+    if denoise >= 0.9999 or steps == 0:
         return [float(x) for x in full_schedule]
-    if denoise <= last + 1e-8:
-        return [denoise]
-    for idx in range(len(full_schedule) - 1):
-        hi = float(full_schedule[idx])
-        lo = float(full_schedule[idx + 1])
-        if hi >= denoise >= lo:
-            if abs(hi - denoise) <= 1e-8:
-                return [float(x) for x in full_schedule[idx:]]
-            return [denoise] + [float(x) for x in full_schedule[idx + 1 :]]
-    return [denoise, last]
+    if denoise <= 0.0:
+        return [0.0]
+
+    total_steps_float = float(steps) / denoise
+    total_steps_int = max(steps, int(math.ceil(total_steps_float)))
+    if total_steps_int == steps:
+        dense_schedule = [float(x) for x in full_schedule]
+    else:
+        if schedule_builder is None:
+            raise ValueError("schedule_builder is required when denoise expands the schedule")
+        dense_schedule = [float(x) for x in schedule_builder(total_steps_int)]
+
+    positions = torch.linspace(0.0, total_steps_float, steps + 1, dtype=torch.float64)
+    out: list[float] = []
+    for pos in positions.tolist():
+        if pos >= total_steps_int:
+            out.append(float(dense_schedule[-1]))
+            continue
+        low_idx = int(math.floor(pos))
+        high_idx = min(low_idx + 1, total_steps_int)
+        frac = float(pos - low_idx)
+        low = float(dense_schedule[low_idx])
+        high = float(dense_schedule[high_idx])
+        out.append((1.0 - frac) * low + frac * high)
+    out[-1] = float(dense_schedule[-1])
+    return out
 
 
 def apply_spatial_denoise_preservation(

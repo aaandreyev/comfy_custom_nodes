@@ -163,12 +163,24 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
         target_denoise_map = denoise_state["target_denoise_map"].to(dtype=torch.float32)
         max_start_denoise = float(target_denoise_map.max().item())
         full_schedule = _get_schedule(steps, image_seq_len, base_shift=base_shift, max_shift=max_shift)
-        schedule = build_continuous_schedule(full_schedule, max_start_denoise)
+        schedule = build_continuous_schedule(
+            full_schedule,
+            max_start_denoise,
+            schedule_builder=lambda total_steps: _get_schedule(
+                total_steps,
+                image_seq_len,
+                base_shift=base_shift,
+                max_shift=max_shift,
+            ),
+        )
 
         generator = torch.Generator(device="cpu").manual_seed(seed)
         noise = torch.randn(latent.shape, generator=generator, dtype=torch.float32, device="cpu")
         if schedule and schedule[0] > 1e-6:
-            x = (1.0 - target_denoise_map) * latent.float() + target_denoise_map * noise
+            if not bool(local_denoise_enabled):
+                x = (1.0 - float(schedule[0])) * latent.float() + float(schedule[0]) * noise
+            else:
+                x = (1.0 - target_denoise_map) * latent.float() + target_denoise_map * noise
         else:
             x = latent.float().clone()
         x = x.to(device=device, dtype=model_dtype)
@@ -295,9 +307,9 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
                         )
                         pred = pred_uncond + cfg * (pred - pred_uncond)
 
-            if preview_callback is not None:
-                x0_est = (x - t_curr * pred) if t_curr > 1e-6 else x
-                preview_callback(i, x0_est.cpu().float(), x.cpu().float(), total_steps)
+                if preview_callback is not None:
+                    x0_est = (x - t_curr * pred) if t_curr > 1e-6 else x
+                    preview_callback(i, x0_est.cpu().float(), x.cpu().float(), total_steps)
 
                 x = x + (t_prev - t_curr) * pred
                 x = apply_spatial_denoise_preservation(
