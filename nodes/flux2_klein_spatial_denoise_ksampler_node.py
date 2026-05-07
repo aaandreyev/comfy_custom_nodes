@@ -152,7 +152,8 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
         )
 
         comfy.model_management.load_models_gpu([model])
-        diffusion_model = model.model.diffusion_model
+        real_model = model.model  # BaseModel (Flux2); required by process_conds / calc_cond_batch
+        diffusion_model = real_model.diffusion_model
         model_dtype = diffusion_model.dtype
 
         patch_size = diffusion_model.patch_size
@@ -198,8 +199,10 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
         has_guidance_embed = getattr(diffusion_model.params, "guidance_embed", False)
         model_options = model.model_options
 
+        # pre_run sets real_model.current_patcher = model (required by calc_cond_batch)
+        model.pre_run()
         processed = comfy.samplers.process_conds(
-            model,
+            real_model,
             x,
             {
                 "positive": _clone_conditioning(
@@ -244,45 +247,48 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
                 + (f" uniform_fallback={fallback_count}/{B}" if fallback_count else "")
             )
 
-        with torch.no_grad():
-            for i in trange(total_steps, desc="Flux2KleinSpatialDenoiseKSampler"):
-                comfy.model_management.throw_exception_if_processing_interrupted()
+        try:
+            with torch.no_grad():
+                for i in trange(total_steps, desc="Flux2KleinSpatialDenoiseKSampler"):
+                    comfy.model_management.throw_exception_if_processing_interrupted()
 
-                t_curr = float(schedule[i])
-                t_prev = float(schedule[i + 1])
-                t_vec = torch.full((B,), t_curr, device=device, dtype=model_dtype)
+                    t_curr = float(schedule[i])
+                    t_prev = float(schedule[i + 1])
+                    t_vec = torch.full((B,), t_curr, device=device, dtype=model_dtype)
 
-                if use_cfg:
-                    pred, pred_uncond = comfy.samplers.calc_cond_batch(
-                        model,
-                        [positive_conds, negative_conds],
+                    if use_cfg:
+                        pred, pred_uncond = comfy.samplers.calc_cond_batch(
+                            real_model,
+                            [positive_conds, negative_conds],
+                            x,
+                            t_vec,
+                            model_options,
+                        )
+                        pred = pred_uncond + cfg * (pred - pred_uncond)
+                    else:
+                        (pred,) = comfy.samplers.calc_cond_batch(
+                            real_model,
+                            [positive_conds],
+                            x,
+                            t_vec,
+                            model_options,
+                        )
+
+                    if preview_callback is not None:
+                        x0_est = (x - t_curr * pred) if t_curr > 1e-6 else x
+                        preview_callback(i, x0_est.cpu().float(), x.cpu().float(), total_steps)
+
+                    x = x + (t_prev - t_curr) * pred
+                    x = apply_spatial_denoise_preservation(
                         x,
-                        t_vec,
-                        model_options,
+                        latent_device,
+                        noise_device,
+                        sigma_map_device,
+                        t_prev,
                     )
-                    pred = pred_uncond + cfg * (pred - pred_uncond)
-                else:
-                    (pred,) = comfy.samplers.calc_cond_batch(
-                        model,
-                        [positive_conds],
-                        x,
-                        t_vec,
-                        model_options,
-                    )
-
-                if preview_callback is not None:
-                    x0_est = (x - t_curr * pred) if t_curr > 1e-6 else x
-                    preview_callback(i, x0_est.cpu().float(), x.cpu().float(), total_steps)
-
-                x = x + (t_prev - t_curr) * pred
-                x = apply_spatial_denoise_preservation(
-                    x,
-                    latent_device,
-                    noise_device,
-                    sigma_map_device,
-                    t_prev,
-                )
-                if pbar is not None:
-                    pbar.update(1)
+                    if pbar is not None:
+                        pbar.update(1)
+        finally:
+            model.cleanup()
 
         return ({"samples": x.cpu().float()},)
