@@ -274,11 +274,17 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
                             model_options,
                         )
 
+                    # calc_cond_batch returns x0 (denoised estimate) via apply_model →
+                    # calculate_denoised(sigma, velocity, x) = x - velocity * sigma = x0.
+                    # Euler step for flow matching requires velocity:
+                    #   v = (x - x0) / t_curr,  x_new = x + (t_prev - t_curr) * v
                     if preview_callback is not None:
-                        x0_est = (x - t_curr * pred) if t_curr > 1e-6 else x
-                        preview_callback(i, x0_est.cpu().float(), x.cpu().float(), total_steps)
+                        preview_callback(i, pred.cpu().float(), x.cpu().float(), total_steps)
 
-                    x = x + (t_prev - t_curr) * pred
+                    if t_curr > 1e-6:
+                        x = x + (t_prev - t_curr) * (x - pred) / t_curr
+                    else:
+                        x = pred
                     x = apply_spatial_denoise_preservation(
                         x,
                         latent_device,
