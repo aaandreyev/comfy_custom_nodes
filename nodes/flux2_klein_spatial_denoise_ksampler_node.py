@@ -97,6 +97,7 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
         }
 
     RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
     FUNCTION = "sample"
     CATEGORY = "seam"
 
@@ -132,15 +133,14 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
 
         device = comfy.model_management.get_torch_device()
         latent = latent_image["samples"]
-        reference_latent = latent.float()
         B, _, H, W = latent.shape
 
         mask_t = normalize_mask(mask, (H, W))
-        topology_t = normalize_mask(topology_mask, (H, W)) if topology_mask is not None else None
+        # П3: topology_mask is normalized inside build_local_denoise_state — no pre-normalization needed
         denoise_state = build_local_denoise_state(
             mask_t,
             global_denoise=float(denoise),
-            topology_mask=topology_t,
+            topology_mask=topology_mask,
             local_denoise_enabled=bool(local_denoise_enabled),
             band_width=int(band_width),
             band_gradient_px=int(band_gradient_px),
@@ -156,16 +156,16 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
         model_dtype = diffusion_model.dtype
 
         patch_size = diffusion_model.patch_size
-        h_tokens = (H + patch_size // 2) // patch_size
-        w_tokens = (W + patch_size // 2) // patch_size
+        h_tokens = H // patch_size
+        w_tokens = W // patch_size
         image_seq_len = h_tokens * w_tokens
 
         target_denoise_map = denoise_state["target_denoise_map"].to(dtype=torch.float32)
-        max_start_denoise = float(target_denoise_map.max().item())
+        effective_denoise = float(target_denoise_map.max().item()) if bool(local_denoise_enabled) else float(denoise)
         full_schedule = _get_schedule(steps, image_seq_len, base_shift=base_shift, max_shift=max_shift)
         schedule = build_continuous_schedule(
             full_schedule,
-            float(denoise),
+            effective_denoise,
             schedule_builder=lambda total_steps: _get_schedule(
                 total_steps,
                 image_seq_len,
@@ -199,9 +199,6 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
         if has_guidance_embed:
             guidance_vec = torch.full((B,), guidance_embed, device=device, dtype=model_dtype)
 
-        cond = positive[0][0].to(device=device, dtype=model_dtype)
-        if cond.shape[0] != B:
-            cond = cond[:1].expand(B, -1, -1)
         neg_cond = None
         ref_latents = None
         if use_comfy_cond_pipeline:
@@ -230,6 +227,9 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
             positive_conds = processed["positive"]
             negative_conds = processed.get("negative")
         else:
+            cond = positive[0][0].to(device=device, dtype=model_dtype)
+            if cond.shape[0] != B:
+                cond = cond[:1].expand(B, -1, -1)
             if use_cfg:
                 neg_cond = negative[0][0].to(device=device, dtype=model_dtype)
                 if neg_cond.shape[0] != B:
@@ -249,12 +249,17 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
         preview_callback = latent_preview.prepare_callback(model, total_steps)
 
         if debug:
+            fallback_count = sum(
+                1 for s in denoise_state.get("per_sample", []) if s.get("uniform_fallback")
+            )
             print(
-                f"[Flux2KleinSpatialDenoiseKSampler] steps={total_steps} denoise={denoise:.4f} "
-                f"start_denoise={start_sigma:.4f} local={bool(local_denoise_enabled)} "
+                f"[Flux2KleinSpatialDenoiseKSampler] steps={total_steps} "
+                f"denoise={denoise:.4f} effective_denoise={effective_denoise:.4f} "
+                f"start_sigma={start_sigma:.4f} local={bool(local_denoise_enabled)} "
                 f"band_width={int(band_width)} gradient={int(band_gradient_px)} "
                 f"band_min={float(band_denoise_min):.3f} band_max={float(band_denoise_max):.3f} "
                 f"merge={merge_mode} present={','.join(denoise_state.get('present_positions', ())) or 'auto'}"
+                + (f" uniform_fallback={fallback_count}/{B}" if fallback_count else "")
             )
 
         with torch.no_grad():
