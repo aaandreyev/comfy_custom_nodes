@@ -6,6 +6,7 @@ import torch
 from tqdm.auto import trange
 
 import comfy.model_management
+import comfy.sampler_helpers
 import comfy.samplers
 import comfy.utils
 import latent_preview
@@ -38,13 +39,6 @@ def _seam_temporal_decay(step_index: int, total_steps: int, ramp_curve: float) -
         return 1.0
     progress = step_index / max(total_steps - 1, 1)
     return max(0.0, 1.0 - progress) ** (1.0 / max(ramp_curve, 1e-3))
-
-
-def _seam_temporal_rise(step_index: int, total_steps: int, ramp_curve: float) -> float:
-    if total_steps <= 1:
-        return 1.0
-    progress = step_index / max(total_steps - 1, 1)
-    return max(0.0, progress) ** (1.0 / max(ramp_curve, 1e-3))
 
 
 def _windowed_progress(step_index: int, total_steps: int, start: float, end: float) -> float:
@@ -185,10 +179,11 @@ class SeamGuidedKSamplerNode:
         )
 
         comfy.model_management.load_models_gpu([model])
-        diffusion_model = model.model.diffusion_model
+        real_model = model.model
+        diffusion_model = real_model.diffusion_model
         model_dtype = diffusion_model.dtype
 
-        patch_size = diffusion_model.patch_size
+        patch_size = getattr(diffusion_model, "patch_size", 2)
         h_tokens = (H + patch_size // 2) // patch_size
         w_tokens = (W + patch_size // 2) // patch_size
         image_seq_len = h_tokens * w_tokens
@@ -242,25 +237,22 @@ class SeamGuidedKSamplerNode:
             cond = cond[:1].expand(B, -1, -1)
         neg_cond = None
         ref_latents = None
+        g_embed = float(guidance_embed) if has_guidance_embed else None
+        model.pre_run()
         if use_comfy_cond_pipeline:
+            conds_converted = {
+                "positive": comfy.sampler_helpers.convert_cond(
+                    _clone_conditioning(positive, guidance_embed=g_embed)
+                ),
+            }
+            if negative is not None:
+                conds_converted["negative"] = comfy.sampler_helpers.convert_cond(
+                    _clone_conditioning(negative, guidance_embed=g_embed)
+                )
             processed = comfy.samplers.process_conds(
-                model,
+                real_model,
                 x,
-                {
-                    "positive": _clone_conditioning(
-                        positive,
-                        guidance_embed=float(guidance_embed) if has_guidance_embed else None,
-                    ),
-                    **(
-                        {
-                            "negative": _clone_conditioning(
-                                negative,
-                                guidance_embed=float(guidance_embed) if has_guidance_embed else None,
-                            )
-                        }
-                        if negative is not None else {}
-                    ),
-                },
+                conds_converted,
                 device,
                 latent_image=latent_device,
                 seed=seed,
@@ -297,108 +289,110 @@ class SeamGuidedKSamplerNode:
         active_start = max(1, int(seam_start_step))
         active_end = total_steps if int(seam_end_step) <= 0 else min(int(seam_end_step), total_steps)
 
-        with torch.no_grad():
-            for i in trange(total_steps, desc="Seam Guided KSampler"):
-                comfy.model_management.throw_exception_if_processing_interrupted()
+        try:
+            with torch.no_grad():
+                for i in trange(total_steps, desc="Seam Guided KSampler"):
+                    comfy.model_management.throw_exception_if_processing_interrupted()
 
-                t_curr = schedule[i]
-                t_prev = schedule[i + 1]
-                t_vec = torch.full((B,), t_curr, device=device, dtype=model_dtype)
-                if use_comfy_cond_pipeline:
-                    if use_cfg:
-                        pred, pred_uncond = comfy.samplers.calc_cond_batch(
-                            model,
-                            [positive_conds, negative_conds],
-                            x,
-                            t_vec,
-                            model_options,
-                        )
-                        pred = pred_uncond + cfg * (pred - pred_uncond)
+                    t_curr = schedule[i]
+                    t_prev = schedule[i + 1]
+                    t_vec = torch.full((B,), t_curr, device=device, dtype=model_dtype)
+                    if use_comfy_cond_pipeline:
+                        if use_cfg:
+                            pred, pred_uncond = comfy.samplers.calc_cond_batch(
+                                real_model,
+                                [positive_conds, negative_conds],
+                                x,
+                                t_vec,
+                                model_options,
+                            )
+                            pred = pred_uncond + cfg * (pred - pred_uncond)
+                        else:
+                            (pred,) = comfy.samplers.calc_cond_batch(
+                                real_model,
+                                [positive_conds],
+                                x,
+                                t_vec,
+                                model_options,
+                            )
                     else:
-                        (pred,) = comfy.samplers.calc_cond_batch(
-                            model,
-                            [positive_conds],
+                        transformer_options = model.model_options.get("transformer_options", {}).copy()
+                        transformer_options["sigmas"] = t_vec
+                        pred = diffusion_model.forward(
                             x,
                             t_vec,
-                            model_options,
-                        )
-                else:
-                    transformer_options = model.model_options.get("transformer_options", {}).copy()
-                    transformer_options["sigmas"] = t_vec
-                    pred = diffusion_model.forward(
-                        x,
-                        t_vec,
-                        cond,
-                        y=None,
-                        guidance=guidance_vec,
-                        ref_latents=ref_latents,
-                        control=None,
-                        transformer_options=transformer_options,
-                    )
-                    if use_cfg:
-                        pred_uncond = diffusion_model.forward(
-                            x,
-                            t_vec,
-                            neg_cond,
+                            cond,
                             y=None,
                             guidance=guidance_vec,
                             ref_latents=ref_latents,
                             control=None,
                             transformer_options=transformer_options,
                         )
-                        pred = pred_uncond + cfg * (pred - pred_uncond)
+                        if use_cfg:
+                            pred_uncond = diffusion_model.forward(
+                                x,
+                                t_vec,
+                                neg_cond,
+                                y=None,
+                                guidance=guidance_vec,
+                                ref_latents=ref_latents,
+                                control=None,
+                                transformer_options=transformer_options,
+                            )
+                            pred = pred_uncond + cfg * (pred - pred_uncond)
 
-                if preview_callback is not None:
-                    x0_est = (x - t_curr * pred) if t_curr > 1e-6 else x
-                    preview_callback(i, x0_est.cpu().float(), x.cpu().float(), total_steps)
+                    if preview_callback is not None:
+                        x0_est = (x - t_curr * pred) if t_curr > 1e-6 else x
+                        preview_callback(i, x0_est.cpu().float(), x.cpu().float(), total_steps)
 
-                x = x + (t_prev - t_curr) * pred
+                    x = x + (t_prev - t_curr) * pred
 
-                step_num = i + 1
-                if algorithm_mode == "phased_experimental":
-                    if noise_mode == "matched_noise":
-                        phase = 1.0 - _windowed_progress(i, total_steps, 0.0, 0.6)
-                        seam_temporal = max(0.0, phase) ** (1.0 / max(float(seam_noise_ramp_curve), 1e-3))
+                    step_num = i + 1
+                    if algorithm_mode == "phased_experimental":
+                        if noise_mode == "matched_noise":
+                            phase = 1.0 - _windowed_progress(i, total_steps, 0.0, 0.6)
+                            seam_temporal = max(0.0, phase) ** (1.0 / max(float(seam_noise_ramp_curve), 1e-3))
+                        else:
+                            phase = 1.0 - _windowed_progress(i, total_steps, 0.25, 1.0)
+                            seam_temporal = max(0.0, phase) ** (1.0 / max(float(seam_noise_ramp_curve), 1e-3))
+                        low_freq_phase = _windowed_progress(i, total_steps, 0.5, 1.0)
+                        low_freq_temporal = max(0.0, low_freq_phase) ** (1.0 / max(float(seam_noise_ramp_curve), 1e-3))
+                        match_contribution_variance = noise_mode == "matched_noise"
                     else:
-                        phase = _windowed_progress(i, total_steps, 0.25, 1.0)
-                        seam_temporal = max(0.0, phase) ** (1.0 / max(float(seam_noise_ramp_curve), 1e-3))
-                    low_freq_phase = _windowed_progress(i, total_steps, 0.5, 1.0)
-                    low_freq_temporal = max(0.0, low_freq_phase) ** (1.0 / max(float(seam_noise_ramp_curve), 1e-3))
-                    match_contribution_variance = noise_mode == "matched_noise"
-                else:
-                    seam_temporal = _seam_temporal_decay(i, total_steps, float(seam_noise_ramp_curve))
-                    low_freq_temporal = _seam_temporal_decay(i, total_steps, float(seam_noise_ramp_curve))
-                    match_contribution_variance = False
-                if (
-                    (seam_noise_strength > 0.0 or float(low_freq_anchor_strength) > 0.0)
-                    and (
-                        anchor_state["sides"]
-                        or anchor_state.get("extra_contributions")
-                        or anchor_state.get("low_freq_target") is not None
-                    )
-                    and max(seam_temporal, low_freq_temporal) > 1e-5
-                    and active_start <= step_num <= active_end
-                ):
-                    x = apply_seam_latent_guidance(
-                        x,
-                        anchor_state,
-                        seam_noise_strength * seam_temporal,
-                        mode=noise_mode,
-                        boundary_only=bool(boundary_only_guidance),
-                        low_freq_strength=float(low_freq_anchor_strength) * low_freq_temporal,
-                        match_contribution_variance=match_contribution_variance,
-                    )
-                    if debug:
-                        print(
-                            f"[SeamGuidedKSampler] step={i + 1} sigma={t_curr:.4f} "
-                            f"seam_temporal={seam_temporal:.3f} "
-                            f"low_freq_temporal={low_freq_temporal:.3f} "
-                            f"effective={seam_noise_strength * seam_temporal:.3f} "
-                            f"mode={noise_mode}"
+                        seam_temporal = _seam_temporal_decay(i, total_steps, float(seam_noise_ramp_curve))
+                        low_freq_temporal = _seam_temporal_decay(i, total_steps, float(seam_noise_ramp_curve))
+                        match_contribution_variance = False
+                    if (
+                        (seam_noise_strength > 0.0 or float(low_freq_anchor_strength) > 0.0)
+                        and (
+                            anchor_state["sides"]
+                            or anchor_state.get("has_extra_contributions")
+                            or anchor_state.get("low_freq_target") is not None
                         )
-                if generation_weight is not None:
-                    ref_x = (1.0 - t_prev) * ref_latent_device + t_prev * noise_device
-                    x = x * generation_weight + ref_x * (1.0 - generation_weight)
-                pbar.update(1)
-
+                        and max(seam_temporal, low_freq_temporal) > 1e-5
+                        and active_start <= step_num <= active_end
+                    ):
+                        x = apply_seam_latent_guidance(
+                            x,
+                            anchor_state,
+                            seam_noise_strength * seam_temporal,
+                            mode=noise_mode,
+                            boundary_only=bool(boundary_only_guidance),
+                            low_freq_strength=float(low_freq_anchor_strength) * low_freq_temporal,
+                            match_contribution_variance=match_contribution_variance,
+                        )
+                        if debug:
+                            print(
+                                f"[SeamGuidedKSampler] step={i + 1} sigma={t_curr:.4f} "
+                                f"seam_temporal={seam_temporal:.3f} "
+                                f"low_freq_temporal={low_freq_temporal:.3f} "
+                                f"effective={seam_noise_strength * seam_temporal:.3f} "
+                                f"mode={noise_mode}"
+                            )
+                    if generation_weight is not None:
+                        ref_x = (1.0 - t_prev) * ref_latent_device + t_prev * noise_device
+                        x = x * generation_weight + ref_x * (1.0 - generation_weight)
+                    pbar.update(1)
+        finally:
+            model.cleanup()
         return ({"samples": x.cpu().float()},)

@@ -28,10 +28,12 @@ class SeamLatentAnchorNode:
                 "debug": ("BOOLEAN", {"default": False}),
                 "low_freq_anchor_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "low_freq_anchor_decay_px": ("INT", {"default": 64, "min": 1, "max": 1024, "step": 1}),
+                "safety_ring_px": ("INT", {"default": 0, "min": 0, "max": 512, "step": 1}),
             },
         }
 
-    RETURN_TYPES = ("MODEL",)
+    RETURN_TYPES = ("MODEL", "MASK")
+    RETURN_NAMES = ("model", "generation_weight")
     FUNCTION = "apply"
     CATEGORY = "seam"
 
@@ -53,10 +55,13 @@ class SeamLatentAnchorNode:
         debug=False,
         low_freq_anchor_strength=0.0,
         low_freq_anchor_decay_px=64,
+        safety_ring_px=0,
     ):
+        samples = anchor_latent["samples"]
         if strength <= 0.0 and float(low_freq_anchor_strength) <= 0.0:
-            return (model,)
-        samples = anchor_latent["samples"].float()
+            zero_mask = torch.zeros(1, samples.shape[-2], samples.shape[-1])
+            return (model, zero_mask)
+        samples = samples.float()
         anchor_state = prepare_seam_anchor_state(
             samples,
             mask,
@@ -69,15 +74,21 @@ class SeamLatentAnchorNode:
             process_bottom=bool(process_bottom),
             reduce=str(profile_reduce),
             low_freq_anchor_decay_px=int(low_freq_anchor_decay_px),
+            safety_ring_px=int(safety_ring_px),
         )
         if (
             not anchor_state["sides"]
-            and not anchor_state.get("extra_contributions")
+            and not anchor_state.get("has_extra_contributions")
             and anchor_state.get("low_freq_target") is None
         ):
             if debug:
                 print("[SeamLatentAnchor] No valid seam context found; node inactive.")
-            return (model,)
+            gen_weight = anchor_state.get("generation_weight")
+            if gen_weight is not None:
+                gen_weight_out = gen_weight[:, 0, :, :]
+            else:
+                gen_weight_out = torch.zeros(1, samples.shape[-2], samples.shape[-1])
+            return (model, gen_weight_out)
 
         _anchor_state = anchor_state
         _strength = float(strength)
@@ -135,4 +146,9 @@ class SeamLatentAnchorNode:
 
         m = model.clone()
         m.model_options.setdefault("sampler_post_cfg_function", []).append(_seam_anchor_fn)
-        return (m,)
+        gen_weight = anchor_state.get("generation_weight")
+        if gen_weight is not None:
+            gen_weight_out = gen_weight[:, 0, :, :]  # [B, H, W]
+        else:
+            gen_weight_out = torch.zeros(1, samples.shape[-2], samples.shape[-1])
+        return (m, gen_weight_out)

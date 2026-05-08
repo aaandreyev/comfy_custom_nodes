@@ -448,6 +448,7 @@ def _build_extra_contributions(
     process_right: bool,
     process_top: bool,
     process_bottom: bool,
+    corner_stats: dict | None = None,
 ) -> list[dict]:
     contributions: list[dict] = []
     if not present_positions:
@@ -458,11 +459,12 @@ def _build_extra_contributions(
         "n": bool(process_top),
         "s": bool(process_bottom),
     }
-    corner_stats = {
-        corner: _extract_corner_stats(anchor_latent, bbox, corner, anchor_width_px)
-        for corner in CORNER_POSITIONS
-        if corner in present_positions
-    }
+    if corner_stats is None:
+        corner_stats = {
+            corner: _extract_corner_stats(anchor_latent, bbox, corner, anchor_width_px)
+            for corner in CORNER_POSITIONS
+            if corner in present_positions
+        }
     total_present = len(present_positions)
     for side_pos, corners in SIDE_REPLACEMENT_CORNERS.items():
         if side_pos in present_positions or not process_enabled[side_pos]:
@@ -897,7 +899,7 @@ def prepare_seam_anchor_state(
             "low_freq_weight": torch.cat(low_freq_weights, dim=0) if has_low_freq_weight else None,
             "sides": tuple(sorted(union_sides)),
             "present_positions": tuple(sorted(union_positions)),
-            "extra_contributions": [{}] if any_extra else [],
+            "has_extra_contributions": any_extra,
             "reduce": reduce,
         }
     bbox = mask_bbox(mask)
@@ -975,6 +977,7 @@ def prepare_seam_anchor_state(
         process_right=process_right,
         process_top=process_top,
         process_bottom=process_bottom,
+        corner_stats=corner_stats,
     )
     generation_weight = _build_sampling_generation_weight(
         mask,
@@ -1008,6 +1011,7 @@ def prepare_seam_anchor_state(
         "band_sizes": per_side_band_sizes,
         "sample_widths": per_side_sample_widths,
         "extra_contributions": extra_contributions,
+        "has_extra_contributions": bool(extra_contributions),
         "reduce": reduce,
     }
 
@@ -1035,7 +1039,7 @@ def apply_seam_anchor_correction(
 
     if (effective_strength <= 0.0 and low_freq_strength <= 0.0) or (
         not anchor_state.get("sides")
-        and not anchor_state.get("extra_contributions")
+        and not anchor_state.get("has_extra_contributions")
         and anchor_state.get("low_freq_target") is None
     ):
         return denoised
@@ -1143,7 +1147,7 @@ def apply_seam_latent_guidance(
 
     if (effective_strength <= 0.0 and low_freq_strength <= 0.0) or (
         not anchor_state.get("sides")
-        and not anchor_state.get("extra_contributions")
+        and not anchor_state.get("has_extra_contributions")
         and anchor_state.get("low_freq_target") is None
     ):
         return x
@@ -1177,7 +1181,7 @@ def apply_seam_latent_guidance(
             inner_band = _extract_inner_band(x, bbox, side, band_sizes[side])
             if inner_band is None:
                 continue
-            current_std = _extract_inner_std(x, bbox, side, sample_widths[side])
+            current_std = _extract_inner_std(x, bbox, side, band_sizes[side])
             anchor_std = _match_batch(std_profiles[side], x.shape[0]).to(device=x.device, dtype=x.dtype)
             anchor_std = _match_channels(anchor_std, x.shape[1])
             if current_std is None:
