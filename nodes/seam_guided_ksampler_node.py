@@ -193,7 +193,7 @@ class SeamGuidedKSamplerNode:
             start_idx = 0
             for i, t in enumerate(schedule):
                 if t <= denoise:
-                    start_idx = max(0, i)
+                    start_idx = max(0, i - 1)
                     break
             schedule = schedule[start_idx:]
 
@@ -229,7 +229,7 @@ class SeamGuidedKSamplerNode:
         negative_conds = None
         model_options = model.model_options
         guidance_vec = None
-        if has_guidance_embed:
+        if has_guidance_embed and not use_comfy_cond_pipeline:
             guidance_vec = torch.full((B,), guidance_embed, device=device, dtype=model_dtype)
 
         cond = positive[0][0].to(device=device, dtype=model_dtype)
@@ -274,7 +274,6 @@ class SeamGuidedKSamplerNode:
                         ref_latents = [r.to(device=device, dtype=model_dtype) for r in ref_val]
                     break
         total_steps = max(len(schedule) - 1, 0)
-        pbar = comfy.utils.ProgressBar(total_steps)
         preview_callback = latent_preview.prepare_callback(model, total_steps)
 
         if debug:
@@ -349,14 +348,19 @@ class SeamGuidedKSamplerNode:
 
                     step_num = i + 1
                     if algorithm_mode == "phased_experimental":
-                        if noise_mode == "matched_noise":
+                        if total_steps <= 1:
+                            seam_temporal = 1.0
+                            low_freq_temporal = 1.0
+                        elif noise_mode == "matched_noise":
                             phase = 1.0 - _windowed_progress(i, total_steps, 0.0, 0.6)
                             seam_temporal = max(0.0, phase) ** (1.0 / max(float(seam_noise_ramp_curve), 1e-3))
+                            low_freq_phase = _windowed_progress(i, total_steps, 0.5, 1.0)
+                            low_freq_temporal = max(0.0, low_freq_phase) ** (1.0 / max(float(seam_noise_ramp_curve), 1e-3))
                         else:
                             phase = 1.0 - _windowed_progress(i, total_steps, 0.25, 1.0)
                             seam_temporal = max(0.0, phase) ** (1.0 / max(float(seam_noise_ramp_curve), 1e-3))
-                        low_freq_phase = _windowed_progress(i, total_steps, 0.5, 1.0)
-                        low_freq_temporal = max(0.0, low_freq_phase) ** (1.0 / max(float(seam_noise_ramp_curve), 1e-3))
+                            low_freq_phase = _windowed_progress(i, total_steps, 0.5, 1.0)
+                            low_freq_temporal = max(0.0, low_freq_phase) ** (1.0 / max(float(seam_noise_ramp_curve), 1e-3))
                         match_contribution_variance = noise_mode == "matched_noise"
                     else:
                         seam_temporal = _seam_temporal_decay(i, total_steps, float(seam_noise_ramp_curve))
@@ -392,7 +396,6 @@ class SeamGuidedKSamplerNode:
                     if generation_weight is not None:
                         ref_x = (1.0 - t_prev) * ref_latent_device + t_prev * noise_device
                         x = x * generation_weight + ref_x * (1.0 - generation_weight)
-                    pbar.update(1)
         finally:
             model.cleanup()
         return ({"samples": x.cpu().float()},)

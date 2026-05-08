@@ -1066,10 +1066,9 @@ def apply_seam_anchor_correction(
         correction_profile = anchor_profile - current_profile
         weight = _match_batch(weights[side], denoised.shape[0]).to(device=denoised.device, dtype=denoised.dtype)
         ys, xs = _side_band_slices(bbox, side, band_sizes[side])
-        weight_local = weight[:, :, ys, xs]
         if weight.shape[-2:] != denoised.shape[-2:]:
             weight = F.interpolate(weight, size=denoised.shape[-2:], mode="bilinear", align_corners=False)
-            weight_local = weight[:, :, ys, xs]
+        weight_local = weight[:, :, ys, xs]
         correction_band = _expand_profile_to_band(correction_profile, side, band_sizes[side])
         weighted_sum[:, :, ys, xs] = weighted_sum[:, :, ys, xs] + correction_band * weight_local
         total_weight[:, :, ys, xs] = total_weight[:, :, ys, xs] + weight_local
@@ -1176,7 +1175,6 @@ def apply_seam_latent_guidance(
         current_profile = _match_batch(current_profile, x.shape[0]).to(device=x.device, dtype=x.dtype)
         current_profile = _match_channels(current_profile, x.shape[1])
         ys, xs = _side_band_slices(bbox, side, band_sizes[side])
-        weight_local = weight[:, :, ys, xs]
         if mode == "matched_noise":
             inner_band = _extract_inner_band(x, bbox, side, band_sizes[side])
             if inner_band is None:
@@ -1203,7 +1201,7 @@ def apply_seam_latent_guidance(
             delta_band = _expand_profile_to_band(correction_profile, side, band_sizes[side])
         if weight.shape[-2:] != x.shape[-2:]:
             weight = F.interpolate(weight, size=x.shape[-2:], mode="bilinear", align_corners=False)
-            weight_local = weight[:, :, ys, xs]
+        weight_local = weight[:, :, ys, xs]
         weighted_sum[:, :, ys, xs] = weighted_sum[:, :, ys, xs] + delta_band * weight_local
         total_weight[:, :, ys, xs] = total_weight[:, :, ys, xs] + weight_local
 
