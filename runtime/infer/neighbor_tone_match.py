@@ -466,6 +466,45 @@ def _gather_outer_samples(
     return torch.cat(strips, dim=-1)
 
 
+def _gather_outer_samples_per_element(
+    image: torch.Tensor,
+    soft_mask: torch.Tensor,
+    sides: list[str],
+    band_width: int,
+    union_bbox: tuple[int, int, int, int],
+) -> torch.Tensor | None:
+    """Gather outer strips using per-element bboxes so each element only samples near its own mask."""
+    B = image.shape[0]
+    per_elem: list[torch.Tensor | None] = []
+    min_n: int | None = None
+
+    for b in range(B):
+        m_b = (soft_mask[b : b + 1] > 1e-3).to(dtype=image.dtype)
+        try:
+            bbox_b = mask_bbox(m_b)
+        except RuntimeError:
+            bbox_b = union_bbox
+        strips: list[torch.Tensor] = []
+        for side in sides:
+            strip = _extract_outer_side_strip(image[b : b + 1], bbox_b, side, band_width)
+            if strip is not None:
+                strips.append(strip.flatten(2))
+        if strips:
+            cat = torch.cat(strips, dim=-1)
+            per_elem.append(cat)
+            min_n = cat.shape[-1] if min_n is None else min(min_n, cat.shape[-1])
+        else:
+            per_elem.append(None)
+
+    valid = [s for s in per_elem if s is not None]
+    if not valid or not min_n:
+        return None
+
+    placeholder = valid[0][:, :, :min_n]
+    result = [t[:, :, :min_n] if t is not None else placeholder for t in per_elem]
+    return torch.cat(result, dim=0)
+
+
 def _gaussian_kernel_1d(sigma: float, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     radius = max(1, int(math.ceil(sigma * 3.0)))
     coords = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
@@ -605,8 +644,7 @@ def apply_neighbor_tone_match(
     topology_mask: torch.Tensor | None = None,
     *,
     inner_width: int,
-    inner_flat_top_px: int | None = None,
-    inner_falloff_px: int | None = None,
+    inner_flat_top_px: int = 0,
     process_left: bool,
     process_right: bool,
     process_top: bool,
@@ -630,8 +668,6 @@ def apply_neighbor_tone_match(
         raise ValueError("reference_rgb, drift_source_rgb, and generated_rgb must have the same shape")
 
     image_dtype = reference_rgb.dtype
-    if inner_flat_top_px is None:
-        inner_flat_top_px = 0 if inner_falloff_px is None else int(inner_falloff_px)
     u_strength = float(chroma_strength if u_strength is None else u_strength)
     v_strength = float(chroma_strength if v_strength is None else v_strength)
     mask = mask.to(dtype=image_dtype)
@@ -694,8 +730,8 @@ def apply_neighbor_tone_match(
     side_deltas: dict[str, torch.Tensor] = {}
     per_side_meta: dict[str, dict] = {}
     outer_width = int(inner_width if outer_band_px is None else outer_band_px)
-    reference_outer_samples = _gather_outer_samples(reference_yuv, bbox, sides, outer_width)
-    drift_outer_samples = _gather_outer_samples(drift_source_yuv, bbox, sides, outer_width)
+    reference_outer_samples = _gather_outer_samples_per_element(reference_yuv, soft_mask, sides, outer_width, bbox)
+    drift_outer_samples = _gather_outer_samples_per_element(drift_source_yuv, soft_mask, sides, outer_width, bbox)
     lookup = None
     if reference_outer_samples is not None and drift_outer_samples is not None:
         lookup = _build_delta_lookup(
@@ -739,7 +775,10 @@ def apply_neighbor_tone_match(
     )
     merged_delta = merged_delta.to(dtype=image_dtype)
     corrected_yuv = generated_yuv + merged_delta
-    corrected_lin = _compress_to_unit_gamut(_yuv_to_rgb(corrected_yuv, matrix=yuv_matrix), corrected_yuv[:, :1].expand(-1, 3, -1, -1))
+    corrected_lin = _compress_to_unit_gamut(
+        _yuv_to_rgb(corrected_yuv, matrix=yuv_matrix),
+        corrected_yuv[:, :1].clamp(0.0, 1.0).expand(-1, 3, -1, -1),
+    )
 
     if color_space == "srgb":
         corrected_rgb = _linear_to_srgb(corrected_lin).clamp(0.0, 1.0)
@@ -786,8 +825,7 @@ def apply_freeform_neighbor_tone_match(
     mask: torch.Tensor,
     *,
     inner_width: int,
-    inner_flat_top_px: int | None = None,
-    inner_falloff_px: int | None = None,
+    inner_flat_top_px: int = 0,
     luma_strength: float,
     chroma_strength: float,
     u_strength: float | None = None,
@@ -806,8 +844,6 @@ def apply_freeform_neighbor_tone_match(
         raise ValueError("reference_rgb and image_rgb must have the same shape")
 
     image_dtype = reference_rgb.dtype
-    if inner_flat_top_px is None:
-        inner_flat_top_px = 0 if inner_falloff_px is None else int(inner_falloff_px)
     u_strength = float(chroma_strength if u_strength is None else u_strength)
     v_strength = float(chroma_strength if v_strength is None else v_strength)
 
@@ -870,8 +906,18 @@ def apply_freeform_neighbor_tone_match(
             lut_mode=lut_mode,
             matrix=yuv_matrix,
         )
-        delta_full = _lookup_delta(img_yuv[idx : idx + 1], lookup) * channel_scale
-        delta_full = _gaussian_blur_band(delta_full, float(delta_smoothing_sigma))
+        H, W = mask_bool.shape
+        rows_i, cols_i = np.where(inner_band)
+        margin = int(math.ceil(delta_smoothing_sigma * 3)) if delta_smoothing_sigma > 0.0 else 0
+        r0 = max(int(rows_i.min()) - margin, 0)
+        r1 = min(int(rows_i.max()) + margin + 1, H)
+        c0 = max(int(cols_i.min()) - margin, 0)
+        c1 = min(int(cols_i.max()) + margin + 1, W)
+        gen_crop = img_yuv[idx : idx + 1, :, r0:r1, c0:c1]
+        delta_crop = _lookup_delta(gen_crop, lookup) * channel_scale
+        delta_crop = _gaussian_blur_band(delta_crop, float(delta_smoothing_sigma))
+        delta_full = torch.zeros(1, img_yuv.shape[1], H, W, device=img_yuv.device, dtype=img_yuv.dtype)
+        delta_full[:, :, r0:r1, c0:c1] = delta_crop
 
         inner_weight_np = _freeform_inner_weight(
             dist_in,
@@ -881,17 +927,14 @@ def apply_freeform_neighbor_tone_match(
         inner_weight = torch.from_numpy(inner_weight_np).to(device=delta_full.device, dtype=delta_full.dtype).view(1, 1, *mask_bool.shape)
         corrected_yuv = img_yuv[idx : idx + 1] + delta_full * inner_weight * soft_mask[idx : idx + 1]
 
+        neutral = corrected_yuv[:, :1].clamp(0.0, 1.0).expand(-1, 3, -1, -1)
         if color_space == "srgb":
             corrected_rgb = _linear_to_srgb(
-                _compress_to_unit_gamut(
-                    _yuv_to_rgb(corrected_yuv, matrix=yuv_matrix),
-                    corrected_yuv[:, :1].expand(-1, 3, -1, -1),
-                )
+                _compress_to_unit_gamut(_yuv_to_rgb(corrected_yuv, matrix=yuv_matrix), neutral)
             ).clamp(0.0, 1.0)
         else:
             corrected_rgb = _compress_to_unit_gamut(
-                _yuv_to_rgb(corrected_yuv, matrix=yuv_matrix),
-                corrected_yuv[:, :1].expand(-1, 3, -1, -1),
+                _yuv_to_rgb(corrected_yuv, matrix=yuv_matrix), neutral
             )
         corrected_rgb = corrected_rgb * soft_mask[idx : idx + 1] + image_rgb[idx : idx + 1] * (1.0 - soft_mask[idx : idx + 1])
         corrected_rgb = corrected_rgb.to(dtype=image_dtype)
@@ -940,12 +983,22 @@ def write_neighbor_tone_debug(
         _save_tensor(_signed_preview(delta[0]), root / f"side_{side}_delta.png")
     for side, weight in debug.get("weights", {}).items():
         _save_tensor(weight[0].repeat(3, 1, 1), root / f"weight_map_{side}.png")
-    summary = {
-        "reason": debug.get("reason", "applied"),
-        "bbox": list(debug.get("bbox", [])),
-        "per_side": debug.get("per_side", {}),
-        "debug_root": str(root),
-    }
+    if "per_sample" in debug:
+        summary = {
+            "mode": "freeform",
+            "reason": debug.get("reason", "applied"),
+            "bbox": list(debug.get("bbox", [])),
+            "per_sample": debug.get("per_sample", []),
+            "debug_root": str(root),
+        }
+    else:
+        summary = {
+            "mode": "rectangular",
+            "reason": debug.get("reason", "applied"),
+            "bbox": list(debug.get("bbox", [])),
+            "per_side": debug.get("per_side", {}),
+            "debug_root": str(root),
+        }
     (root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return root
 

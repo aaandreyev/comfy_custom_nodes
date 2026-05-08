@@ -74,6 +74,12 @@ class FreeformNeighborToneMatchNode:
         if mask_t.shape[-2:] != img_rgb.shape[-2:]:
             mask_t = F.interpolate(mask_t, size=img_rgb.shape[-2:], mode="nearest")
 
+        if (mask_t > 0.5).sum() == 0:
+            raise ValueError(
+                "FreeformNeighborToneMatchNode: mask has no active pixels (no values above 0.5). "
+                "Check that the mask is correctly connected and not empty."
+            )
+
         corrected_rgb, debug = apply_freeform_neighbor_tone_match(
             ref_rgb,
             img_rgb,
