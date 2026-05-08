@@ -16,7 +16,6 @@ except ModuleNotFoundError:  # Optional in bare test environments without ComfyU
     latent_preview = None
 
 from ..runtime.infer.spatial_edit_denoise import (
-    apply_spatial_denoise_preservation,
     build_continuous_schedule,
     build_local_denoise_state,
     normalize_mask,
@@ -183,18 +182,20 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
         )
         start_sigma = float(schedule[0]) if schedule else 0.0
 
-        # BUG-1: Scale per-pixel denoise fractions into schedule sigma space.
+        # sigma_map: per-pixel "join sigma" in schedule space — pixel becomes ACTIVE
+        # for denoising once t_curr drops to its sigma_map value (DD-style binary gate).
         # target_denoise_map ∈ [0, effective_denoise]; sigma_map ∈ [0, start_sigma].
-        # Without this, local-denoise pixels are initialized at the wrong noise level
-        # relative to the time-shifted schedule start (e.g. effective_denoise=0.5 maps
-        # to start_sigma≈0.76 after time-shift, so raw target values under-noise).
         sigma_scale = start_sigma / effective_denoise if effective_denoise > 1e-6 else 1.0
         sigma_map = (target_denoise_map * sigma_scale).clamp(0.0, 1.0)
 
         generator = torch.Generator(device="cpu").manual_seed(seed)
         noise = torch.randn(latent.shape, generator=generator, dtype=torch.float32, device="cpu")
+        # DD-style init: UNIFORM noise at start_sigma. Per-pixel handling happens
+        # in the loop via re-noising frozen pixels each step. This way the model
+        # always sees a consistent noise level — no biased predictions for partial
+        # sigma_map pixels.
         if schedule and start_sigma > 1e-6:
-            x = (1.0 - sigma_map) * latent.float() + sigma_map * noise
+            x = (1.0 - start_sigma) * latent.float() + start_sigma * noise
         else:
             x = latent.float().clone()
         x = x.to(device=device, dtype=model_dtype)
@@ -272,11 +273,25 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
                     t_prev = float(schedule[i + 1])
                     t_vec = torch.full((B,), t_curr, device=device, dtype=model_dtype)
 
+                    # DD-style binary gate: pixel is ACTIVE iff sigma_map >= t_curr.
+                    # threshold sweeps from start_sigma → 0 over the schedule, so:
+                    #   sigma_map=start_sigma → active throughout
+                    #   sigma_map=0           → frozen throughout (stays as latent)
+                    #   sigma_map=mid         → joins denoising once t_curr drops to its level
+                    active_mask = (sigma_map_device >= t_curr).to(dtype=model_dtype)
+                    frozen_mask = 1.0 - active_mask
+
+                    # Pre-model: re-noise frozen pixels to current sigma so the model
+                    # always sees a uniform noise level (consistent input).
+                    # Flow matching CONST: noisy_at_t = (1-t)*latent + t*noise.
+                    noisy_at_t_curr = (1.0 - t_curr) * latent_device + t_curr * noise_device
+                    x_for_model = x * active_mask + noisy_at_t_curr * frozen_mask
+
                     if use_cfg:
                         pred, pred_uncond = comfy.samplers.calc_cond_batch(
                             real_model,
                             [positive_conds, negative_conds],
-                            x,
+                            x_for_model,
                             t_vec,
                             model_options,
                         )
@@ -285,29 +300,24 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
                         (pred,) = comfy.samplers.calc_cond_batch(
                             real_model,
                             [positive_conds],
-                            x,
+                            x_for_model,
                             t_vec,
                             model_options,
                         )
 
-                    # calc_cond_batch returns x0 (denoised estimate) via apply_model →
-                    # calculate_denoised(sigma, velocity, x) = x - velocity * sigma = x0.
-                    # Euler step for flow matching requires velocity:
-                    #   v = (x - x0) / t_curr,  x_new = x + (t_prev - t_curr) * v
-                    if preview_callback is not None:
-                        preview_callback(i, pred.cpu().float(), x.cpu().float(), total_steps)
+                    # Post-model: replace frozen pixel x0 estimates with clean latent so
+                    # the Euler step naturally re-noises them to t_prev (no progress).
+                    pred_corrected = pred * active_mask + latent_device * frozen_mask
 
+                    if preview_callback is not None:
+                        preview_callback(i, pred_corrected.cpu().float(), x_for_model.cpu().float(), total_steps)
+
+                    # calc_cond_batch returns x0 (denoised estimate). Convert to velocity
+                    # for the Euler step: v = (x - x0)/t_curr → x_new = x + dt*v.
                     if t_curr > 1e-6:
-                        x = x + (t_prev - t_curr) * (x - pred) / t_curr
+                        x = x_for_model + (t_prev - t_curr) * (x_for_model - pred_corrected) / t_curr
                     else:
-                        x = pred
-                    x = apply_spatial_denoise_preservation(
-                        x,
-                        latent_device,
-                        noise_device,
-                        sigma_map_device,
-                        t_prev,
-                    )
+                        x = pred_corrected
                     if pbar is not None:
                         pbar.update(1)
         finally:
