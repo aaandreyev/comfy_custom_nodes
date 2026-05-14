@@ -177,6 +177,40 @@ def _clamp_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> tup
     return (x0, y0, max(x0, x1), max(y0, y1))
 
 
+def _nearest_multiple_of_8(x: int) -> int:
+    """Nearest positive multiple of 8 for spatial sizes (minimum 8)."""
+    x = int(x)
+    if x <= 0:
+        return 8
+    rounded = int(round(x / 8.0)) * 8
+    return max(8, rounded)
+
+
+def _align_crop_outputs_to_multiple_of_8(
+    cropped_image: torch.Tensor,
+    cropped_mask: torch.Tensor,
+    blend_mask: torch.Tensor,
+    crop_support_canvas: torch.Tensor,
+    *,
+    natural_w: int,
+    natural_h: int,
+    downscale_algorithm: str,
+    upscale_algorithm: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Resize crop tensors so H,W are multiples of 8 for VAE-friendly inpainting."""
+    tw = _nearest_multiple_of_8(natural_w)
+    th = _nearest_multiple_of_8(natural_h)
+    if tw == natural_w and th == natural_h:
+        return cropped_image, cropped_mask, blend_mask, crop_support_canvas, tw, th
+    algo = upscale_algorithm if tw >= natural_w and th >= natural_h else downscale_algorithm
+    resized_image = _resize_image(cropped_image, tw, th, algo)
+    resized_mask = _resize_mask_nearest(cropped_mask, tw, th)
+    resized_mask = (resized_mask > 0.5).float()
+    resized_blend = _resize_alpha(blend_mask, tw, th)
+    resized_support = _resize_mask_nearest(crop_support_canvas, tw, th).clamp(0.0, 1.0)
+    return resized_image, resized_mask, resized_blend, resized_support, tw, th
+
+
 @dataclass
 class SingleCropResult:
     canvas_image: torch.Tensor
@@ -198,6 +232,8 @@ def _prepare_single_crop(
     mask_expand_pixels: int,
     mask_blend_pixels: int,
     context_from_mask_extend_factor: float,
+    *,
+    align_crop_spatial_multiple_of_8: bool,
 ) -> SingleCropResult:
     orig_box = (0, 0, int(image.shape[2]), int(image.shape[1]))
     selection_mask = _binary_mask_default(mask)
@@ -221,8 +257,25 @@ def _prepare_single_crop(
     crop_support_canvas = content_mask.clone()
     cropped_image = content_image
     cropped_mask = content_mask
-    output_content_box = (0, 0, ctc_w, ctc_h)
     blend_mask = _inward_blend_mask(cropped_mask > 0.5, int(mask_blend_pixels))
+    cropped_mask_bin = (cropped_mask > 0.5).float()
+
+    out_w, out_h = int(ctc_w), int(ctc_h)
+    if align_crop_spatial_multiple_of_8:
+        cropped_image, cropped_mask_bin, blend_mask, crop_support_canvas, out_w, out_h = (
+            _align_crop_outputs_to_multiple_of_8(
+                cropped_image,
+                cropped_mask_bin,
+                blend_mask,
+                crop_support_canvas,
+                natural_w=int(ctc_w),
+                natural_h=int(ctc_h),
+                downscale_algorithm=downscale_algorithm,
+                upscale_algorithm=upscale_algorithm,
+            )
+        )
+
+    output_content_box = (0, 0, out_w, out_h)
 
     return SingleCropResult(
         canvas_image=image,
@@ -230,7 +283,7 @@ def _prepare_single_crop(
         crop_to_canvas=crop_to_canvas,
         output_content_box=output_content_box,
         cropped_image=cropped_image,
-        cropped_mask=(cropped_mask > 0.5).float(),
+        cropped_mask=cropped_mask_bin,
         blend_mask=blend_mask,
         crop_support_canvas=crop_support_canvas,
     )
@@ -246,6 +299,7 @@ def run_zero_drift_crop(
     context_from_mask_extend_factor: float,
     mask: torch.Tensor | None,
     optional_context_mask: torch.Tensor | None,
+    align_crop_spatial_multiple_of_8: bool = True,
 ) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
     image = image.clone()
     mask = _ensure_mask_shape(_clone_or_none(mask), image)
@@ -285,6 +339,7 @@ def run_zero_drift_crop(
             mask_expand_pixels=mask_expand_pixels,
             mask_blend_pixels=mask_blend_pixels,
             context_from_mask_extend_factor=context_from_mask_extend_factor,
+            align_crop_spatial_multiple_of_8=align_crop_spatial_multiple_of_8,
         )
         stitcher["canvas_image"].append(result.canvas_image.cpu())
         stitcher["canvas_to_orig_x"].append(result.canvas_to_orig[0])
@@ -354,6 +409,10 @@ def stitch_zero_drift_result(
             content_mask = _resize_alpha(content_mask, ctc_w, ctc_h)
         else:
             content_mask = content_mask.clamp(0.0, 1.0)
+        mh = int(content_mask.shape[1])
+        mw = int(content_mask.shape[2])
+        if int(crop_support_canvas.shape[1]) != mh or int(crop_support_canvas.shape[2]) != mw:
+            crop_support_canvas = _resize_mask_nearest(crop_support_canvas, mw, mh).clamp(0.0, 1.0)
         alpha = (content_mask * crop_support_canvas).unsqueeze(-1)
         canvas_crop = canvas_image[:, ctc_y : ctc_y + ctc_h, ctc_x : ctc_x + ctc_w, :]
         blended = alpha * content_image + (1.0 - alpha) * canvas_crop

@@ -15,6 +15,7 @@ class ZeroDriftInpaintCropNode:
                 "mask_expand_pixels": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 1}),
                 "mask_blend_pixels": ("INT", {"default": 32, "min": 0, "max": 256, "step": 1}),
                 "context_from_mask_extend_factor": ("FLOAT", {"default": 1.2, "min": 1.0, "max": 100.0, "step": 0.01}),
+                "vae_alignment_multiple_of_8": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "mask": ("MASK",),
@@ -26,7 +27,11 @@ class ZeroDriftInpaintCropNode:
     RETURN_NAMES = ("stitcher", "cropped_image", "cropped_mask")
     FUNCTION = "inpaint_crop"
     CATEGORY = "inpaint"
-    DESCRIPTION = "Pixel-stable crop for inpainting. Returns the natural mask-driven crop with no UI-controlled resize, padding, or geometry toggles."
+    DESCRIPTION = (
+        "Pixel-stable crop for inpainting. When enabled, resizes crop outputs to the nearest "
+        "width and height divisible by 8 for VAE-friendly latent grids; stitch maps back to the "
+        "original crop rectangle on the canvas."
+    )
 
     def inpaint_crop(
         self,
@@ -36,6 +41,7 @@ class ZeroDriftInpaintCropNode:
         mask_expand_pixels,
         mask_blend_pixels,
         context_from_mask_extend_factor,
+        vae_alignment_multiple_of_8,
         mask=None,
         optional_context_mask=None,
     ):
@@ -48,6 +54,7 @@ class ZeroDriftInpaintCropNode:
             context_from_mask_extend_factor=context_from_mask_extend_factor,
             mask=mask,
             optional_context_mask=optional_context_mask,
+            align_crop_spatial_multiple_of_8=vae_alignment_multiple_of_8,
         )
         return (stitcher, cropped_image, cropped_mask)
 

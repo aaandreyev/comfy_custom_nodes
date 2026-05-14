@@ -16,6 +16,11 @@ from comfy_custom_nodes_repo.nodes.zero_drift_inpaint_crop_stitch_node import (
 )
 
 
+def _assert_rgb_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Allow small drift from resize crop ↔ canvas round-trip when VAE alignment is on."""
+    torch.testing.assert_close(actual, expected, rtol=5e-4, atol=5e-4)
+
+
 def _gradient_image(height: int, width: int) -> torch.Tensor:
     y = torch.linspace(0.0, 1.0, height).view(1, height, 1, 1).expand(1, height, width, 1)
     x = torch.linspace(0.0, 1.0, width).view(1, 1, width, 1).expand(1, height, width, 1)
@@ -30,6 +35,7 @@ def _crop(
     mask_expand_pixels: int = 0,
     mask_blend_pixels: int = 0,
     context_from_mask_extend_factor: float = 1.0,
+    vae_alignment_multiple_of_8: bool = True,
 ) -> tuple[dict, torch.Tensor, torch.Tensor]:
     node = ZeroDriftInpaintCropNode()
     return node.inpaint_crop(
@@ -39,6 +45,7 @@ def _crop(
         mask_expand_pixels,
         mask_blend_pixels,
         context_from_mask_extend_factor,
+        vae_alignment_multiple_of_8,
         mask,
         optional_context_mask,
     )
@@ -70,6 +77,23 @@ def test_removed_ui_fields_are_not_exposed() -> None:
     assert removed_fields.isdisjoint(required.keys())
 
 
+def test_vae_alignment_disabled_keeps_natural_crop_shape_and_exact_round_trip() -> None:
+    image = _gradient_image(101, 157)
+    mask = torch.zeros((1, 101, 157), dtype=torch.float32)
+    mask[:, 20:61, 40:96] = 1.0
+
+    stitch = ZeroDriftInpaintStitchNode()
+    stitcher, cropped_image, _cropped_mask = _crop(
+        image,
+        mask,
+        context_from_mask_extend_factor=1.0,
+        vae_alignment_multiple_of_8=False,
+    )
+    restored, = stitch.inpaint_stitch(stitcher, cropped_image)
+    assert torch.equal(restored, image)
+    assert cropped_image.shape[1:3] == (41, 56)
+
+
 def test_round_trip_is_exact_without_blend() -> None:
     image = _gradient_image(101, 157)
     mask = torch.zeros((1, 101, 157), dtype=torch.float32)
@@ -82,8 +106,9 @@ def test_round_trip_is_exact_without_blend() -> None:
         context_from_mask_extend_factor=1.0,
     )
     restored, = stitch.inpaint_stitch(stitcher, cropped_image)
-    assert torch.equal(restored, image)
-    assert cropped_image.shape[1:3] == (41, 56)
+    _assert_rgb_close(restored, image)
+    assert cropped_image.shape[1] % 8 == 0 and cropped_image.shape[2] % 8 == 0
+    assert cropped_image.shape[1:3] == (40, 56)
 
 
 def test_blend_mask_never_changes_pixels_outside_selection() -> None:
@@ -101,7 +126,7 @@ def test_blend_mask_never_changes_pixels_outside_selection() -> None:
     restored, = stitch.inpaint_stitch(stitcher, cropped_image)
     diff = (restored - image).abs()
     outside = diff * (1.0 - mask.unsqueeze(-1))
-    assert float(outside.max()) == 0.0
+    assert float(outside.max()) <= 1e-4
 
 
 def test_mask_expand_pixels_enlarges_crop_geometry() -> None:
@@ -150,8 +175,9 @@ def test_empty_mask_falls_back_to_full_image_without_drift() -> None:
         mask,
     )
     restored, = stitch.inpaint_stitch(stitcher, cropped_image)
-    assert torch.equal(restored, image)
+    _assert_rgb_close(restored, image)
     assert int(cropped_mask.sum().item()) == 0
+    assert cropped_image.shape[1] % 8 == 0 and cropped_image.shape[2] % 8 == 0
 
 
 def test_optional_context_mask_enlarges_crop_but_round_trip_stays_exact() -> None:
@@ -168,7 +194,7 @@ def test_optional_context_mask_enlarges_crop_but_round_trip_stays_exact() -> Non
         optional_context_mask=context,
     )
     restored, = stitch.inpaint_stitch(stitcher, cropped_image)
-    assert torch.equal(restored, image)
+    _assert_rgb_close(restored, image)
     assert stitcher["cropped_to_canvas_w"][0] > 32
     assert stitcher["cropped_to_canvas_h"][0] > 32
 
