@@ -6,6 +6,7 @@ from .nodes.neighbor_tone_match_node import NeighborToneMatchNode
 from .nodes.poisson_inpaint_prefill import PoissonInpaintPrefill
 from .nodes.seam_latent_anchor_node import SeamLatentAnchorNode
 from .nodes.seam_harmonizer_node import SeamHarmonizerV3Node
+from .nodes.zero_drift_inpaint_crop_stitch_node import ZeroDriftInpaintCropNode, ZeroDriftInpaintStitchNode
 from .nodes import SeamGuidedKSamplerNode
 
 try:
@@ -21,6 +22,8 @@ NODE_CLASS_MAPPINGS = {
     "NeighborToneMatch": NeighborToneMatchNode,
     "SeamLatentAnchor": SeamLatentAnchorNode,
     "SeamHarmonizerV3": SeamHarmonizerV3Node,
+    "ZeroDriftInpaintCrop": ZeroDriftInpaintCropNode,
+    "ZeroDriftInpaintStitch": ZeroDriftInpaintStitchNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -30,6 +33,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NeighborToneMatch": "Neighbor Tone Match",
     "SeamLatentAnchor": "Seam Latent Anchor",
     "SeamHarmonizerV3": "Seam Harmonizer v3",
+    "ZeroDriftInpaintCrop": "Zero Drift Inpaint Crop",
+    "ZeroDriftInpaintStitch": "Zero Drift Inpaint Stitch",
 }
 
 if Flux2KleinSpatialDenoiseKSamplerNode is not None:

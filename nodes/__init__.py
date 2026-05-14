@@ -4,6 +4,7 @@ from .neighbor_tone_match_node import NeighborToneMatchNode
 from .poisson_inpaint_prefill import PoissonInpaintPrefill
 from .seam_latent_anchor_node import SeamLatentAnchorNode
 from .seam_harmonizer_node import SeamHarmonizerV3Node
+from .zero_drift_inpaint_crop_stitch_node import ZeroDriftInpaintCropNode, ZeroDriftInpaintStitchNode
 
 try:
     from .flux2_klein_spatial_denoise_ksampler_node import Flux2KleinSpatialDenoiseKSamplerNode
@@ -22,6 +23,8 @@ __all__ = [
     "PoissonInpaintPrefill",
     "SeamLatentAnchorNode",
     "SeamHarmonizerV3Node",
+    "ZeroDriftInpaintCropNode",
+    "ZeroDriftInpaintStitchNode",
 ]
 
 if Flux2KleinSpatialDenoiseKSamplerNode is not None:
