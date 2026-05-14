@@ -8,12 +8,6 @@ import torch
 import torch.nn.functional as F
 
 
-def _round_half_away_from_zero(value: float) -> int:
-    if value >= 0:
-        return int(math.floor(value + 0.5))
-    return -int(math.floor(-value + 0.5))
-
-
 def _clone_or_none(tensor: torch.Tensor | None) -> torch.Tensor | None:
     return None if tensor is None else tensor.clone()
 
@@ -96,35 +90,8 @@ def _ensure_mask_shape(mask: torch.Tensor | None, image: torch.Tensor) -> torch.
     return mask
 
 
-def _binary_mask(mask: torch.Tensor, threshold: float) -> torch.Tensor:
-    if threshold > 0.0:
-        return mask >= threshold
+def _binary_mask_default(mask: torch.Tensor) -> torch.Tensor:
     return mask > 0.0
-
-
-def _fill_holes_single(mask: torch.Tensor) -> torch.Tensor:
-    inv = ~mask
-    exterior = torch.zeros_like(inv, dtype=torch.bool)
-    if inv.shape[0] == 0 or inv.shape[1] == 0:
-        return mask
-    exterior[0, :] = inv[0, :]
-    exterior[-1, :] = inv[-1, :]
-    exterior[:, 0] = inv[:, 0]
-    exterior[:, -1] = inv[:, -1]
-    exterior = exterior.unsqueeze(0).unsqueeze(0).float()
-    inv_f = inv.unsqueeze(0).unsqueeze(0)
-    while True:
-        grown = F.max_pool2d(exterior, kernel_size=3, stride=1, padding=1) > 0.5
-        grown = torch.logical_and(grown, inv_f)
-        if torch.equal(grown, exterior > 0.5):
-            break
-        exterior = grown.float()
-    holes = torch.logical_and(inv, ~(exterior[0, 0] > 0.5))
-    return torch.logical_or(mask, holes)
-
-
-def _fill_holes(mask: torch.Tensor) -> torch.Tensor:
-    return torch.stack([_fill_holes_single(item) for item in mask], dim=0)
 
 
 def _dilate_mask(mask: torch.Tensor, pixels: int) -> torch.Tensor:
@@ -201,119 +168,13 @@ def _union_bbox(
     )
 
 
-def _fit_bbox_to_aspect(bbox: tuple[int, int, int, int], aspect_ratio: float) -> tuple[int, int, int, int]:
+def _clamp_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
     x0, y0, x1, y1 = bbox
-    width = x1 - x0
-    height = y1 - y0
-    if width <= 0 or height <= 0:
-        return bbox
-    current_ratio = width / height
-    if abs(current_ratio - aspect_ratio) < 1e-12:
-        return bbox
-    center_x = x0 + width / 2.0
-    center_y = y0 + height / 2.0
-    if current_ratio < aspect_ratio:
-        target_w = int(math.ceil(height * aspect_ratio))
-        target_h = height
-    else:
-        target_w = width
-        target_h = int(math.ceil(width / aspect_ratio))
-    new_x0 = int(math.floor(center_x - target_w / 2.0))
-    new_y0 = int(math.floor(center_y - target_h / 2.0))
-    return (new_x0, new_y0, new_x0 + target_w, new_y0 + target_h)
-
-
-def _pad_image_and_masks(
-    image: torch.Tensor,
-    selection_mask: torch.Tensor,
-    context_mask: torch.Tensor,
-    left: int,
-    top: int,
-    right: int,
-    bottom: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    image_nchw = _to_nchw(image)
-    image_nchw = F.pad(image_nchw, (left, right, top, bottom), mode="replicate")
-    image = _to_nhwc(image_nchw)
-    selection_mask = F.pad(selection_mask.unsqueeze(1).float(), (left, right, top, bottom), mode="constant", value=1.0)[:, 0] > 0.5
-    context_mask = F.pad(context_mask.unsqueeze(1).float(), (left, right, top, bottom), mode="constant", value=0.0)[:, 0] > 0.5
-    return image, selection_mask, context_mask
-
-
-def _extend_image_and_masks(
-    image: torch.Tensor,
-    selection_mask: torch.Tensor,
-    context_mask: torch.Tensor,
-    extend_up_factor: float,
-    extend_down_factor: float,
-    extend_left_factor: float,
-    extend_right_factor: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, int, int, int]]:
-    height = int(image.shape[1])
-    width = int(image.shape[2])
-    top_delta = _round_half_away_from_zero(height * (extend_up_factor - 1.0))
-    bottom_delta = _round_half_away_from_zero(height * (extend_down_factor - 1.0))
-    left_delta = _round_half_away_from_zero(width * (extend_left_factor - 1.0))
-    right_delta = _round_half_away_from_zero(width * (extend_right_factor - 1.0))
-    new_height = height + top_delta + bottom_delta
-    new_width = width + left_delta + right_delta
-    if new_height <= 0 or new_width <= 0:
-        raise AssertionError(f"Invalid extended size: {new_width}x{new_height}")
-    pad_left = max(0, left_delta)
-    pad_right = max(0, right_delta)
-    pad_top = max(0, top_delta)
-    pad_bottom = max(0, bottom_delta)
-    if pad_left or pad_right or pad_top or pad_bottom:
-        image, selection_mask, context_mask = _pad_image_and_masks(
-            image,
-            selection_mask,
-            context_mask,
-            pad_left,
-            pad_top,
-            pad_right,
-            pad_bottom,
-        )
-    crop_x0 = max(0, -left_delta)
-    crop_y0 = max(0, -top_delta)
-    crop_x1 = crop_x0 + new_width
-    crop_y1 = crop_y0 + new_height
-    image = image[:, crop_y0:crop_y1, crop_x0:crop_x1, :]
-    selection_mask = selection_mask[:, crop_y0:crop_y1, crop_x0:crop_x1]
-    context_mask = context_mask[:, crop_y0:crop_y1, crop_x0:crop_x1]
-    orig_x = pad_left - crop_x0
-    orig_y = pad_top - crop_y0
-    orig_x0 = max(0, orig_x)
-    orig_y0 = max(0, orig_y)
-    orig_x1 = min(new_width, orig_x + width)
-    orig_y1 = min(new_height, orig_y + height)
-    orig_box = (orig_x0, orig_y0, max(0, orig_x1 - orig_x0), max(0, orig_y1 - orig_y0))
-    return image, selection_mask, context_mask, orig_box
-
-
-def _pad_output_to_multiple(
-    image: torch.Tensor,
-    mask: torch.Tensor,
-    multiple: int,
-) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int, int, int]]:
-    if multiple <= 0:
-        return image, mask, (0, 0, int(image.shape[2]), int(image.shape[1]))
-    content_h = int(image.shape[1])
-    content_w = int(image.shape[2])
-    padded_w = int(math.ceil(content_w / multiple) * multiple)
-    padded_h = int(math.ceil(content_h / multiple) * multiple)
-    pad_w = padded_w - content_w
-    pad_h = padded_h - content_h
-    left = pad_w // 2
-    right = pad_w - left
-    top = pad_h // 2
-    bottom = pad_h - top
-    if not (left or right or top or bottom):
-        return image, mask, (0, 0, content_w, content_h)
-    image_nchw = _to_nchw(image)
-    image_nchw = F.pad(image_nchw, (left, right, top, bottom), mode="replicate")
-    image = _to_nhwc(image_nchw)
-    mask = F.pad(mask.unsqueeze(1).float(), (left, right, top, bottom), mode="constant", value=0.0)[:, 0]
-    return image, mask, (left, top, content_w, content_h)
+    x0 = max(0, min(int(x0), width))
+    x1 = max(0, min(int(x1), width))
+    y0 = max(0, min(int(y0), height))
+    y1 = max(0, min(int(y1), height))
+    return (x0, y0, max(x0, x1), max(y0, y1))
 
 
 @dataclass
@@ -334,130 +195,33 @@ def _prepare_single_crop(
     optional_context_mask: torch.Tensor,
     downscale_algorithm: str,
     upscale_algorithm: str,
-    preresize: bool,
-    preresize_mode: str,
-    preresize_min_width: int,
-    preresize_min_height: int,
-    preresize_max_width: int,
-    preresize_max_height: int,
-    extend_for_outpainting: bool,
-    extend_up_factor: float,
-    extend_down_factor: float,
-    extend_left_factor: float,
-    extend_right_factor: float,
-    mask_hipass_filter: float,
-    mask_fill_holes: bool,
     mask_expand_pixels: int,
-    mask_invert: bool,
     mask_blend_pixels: int,
     context_from_mask_extend_factor: float,
-    output_resize_to_target_size: bool,
-    output_target_width: int,
-    output_target_height: int,
-    output_padding: int,
 ) -> SingleCropResult:
     orig_box = (0, 0, int(image.shape[2]), int(image.shape[1]))
-    if preresize:
-        current_width = int(image.shape[2])
-        current_height = int(image.shape[1])
-        target_width = current_width
-        target_height = current_height
-        if preresize_mode == "ensure minimum resolution":
-            scale = max(preresize_min_width / current_width, preresize_min_height / current_height)
-            if scale > 1.0:
-                target_width = int(math.ceil(current_width * scale))
-                target_height = int(math.ceil(current_height * scale))
-        elif preresize_mode == "ensure maximum resolution":
-            scale = min(preresize_max_width / current_width, preresize_max_height / current_height)
-            if scale < 1.0:
-                target_width = max(1, int(math.floor(current_width * scale)))
-                target_height = max(1, int(math.floor(current_height * scale)))
-        elif preresize_mode == "ensure minimum and maximum resolution":
-            if preresize_max_width < preresize_min_width or preresize_max_height < preresize_min_height:
-                raise AssertionError("Preresize maximums must be >= minimums")
-            min_scale = max(preresize_min_width / current_width, preresize_min_height / current_height)
-            max_scale = min(preresize_max_width / current_width, preresize_max_height / current_height)
-            if min_scale > 1.0 and max_scale < 1.0:
-                raise AssertionError("Cannot satisfy both minimum and maximum resize constraints")
-            if min_scale > 1.0:
-                target_width = int(math.ceil(current_width * min_scale))
-                target_height = int(math.ceil(current_height * min_scale))
-            elif max_scale < 1.0:
-                target_width = max(1, int(math.floor(current_width * max_scale)))
-                target_height = max(1, int(math.floor(current_height * max_scale)))
-        if target_width != current_width or target_height != current_height:
-            algorithm = upscale_algorithm if target_width >= current_width and target_height >= current_height else downscale_algorithm
-            image = _resize_image(image, target_width, target_height, algorithm)
-            mask = _resize_mask_nearest(mask, target_width, target_height)
-            optional_context_mask = _resize_mask_nearest(optional_context_mask, target_width, target_height)
-
-    selection_mask = _binary_mask(mask, float(mask_hipass_filter))
-    context_mask = _binary_mask(optional_context_mask, float(mask_hipass_filter))
-    if mask_fill_holes:
-        selection_mask = _fill_holes(selection_mask)
+    selection_mask = _binary_mask_default(mask)
+    context_mask = _binary_mask_default(optional_context_mask)
     if mask_expand_pixels > 0:
         selection_mask = _dilate_mask(selection_mask, int(mask_expand_pixels))
-    if mask_invert:
-        selection_mask = ~selection_mask
-    if extend_for_outpainting:
-        image, selection_mask, context_mask, orig_box = _extend_image_and_masks(
-            image,
-            selection_mask,
-            context_mask,
-            extend_up_factor,
-            extend_down_factor,
-            extend_left_factor,
-            extend_right_factor,
-        )
     bbox = _bbox_from_mask(selection_mask[0])
     if bbox is None:
         bbox = (0, 0, int(image.shape[2]), int(image.shape[1]))
     if context_from_mask_extend_factor > 1.0:
         bbox = _grow_bbox(bbox, float(context_from_mask_extend_factor))
     bbox = _union_bbox(bbox, _bbox_from_mask(context_mask[0])) or bbox
-
-    width = bbox[2] - bbox[0]
-    height = bbox[3] - bbox[1]
-    if output_resize_to_target_size:
-        requested_content_w = int(output_target_width)
-        requested_content_h = int(output_target_height)
-    else:
-        requested_content_w = int(width)
-        requested_content_h = int(height)
-    if requested_content_w <= 0 or requested_content_h <= 0:
-        raise AssertionError(f"Invalid requested crop size: {requested_content_w}x{requested_content_h}")
-
-    crop_box = _fit_bbox_to_aspect(bbox, requested_content_w / requested_content_h)
+    crop_box = _clamp_bbox(bbox, int(image.shape[2]), int(image.shape[1]))
     crop_x0, crop_y0, crop_x1, crop_y1 = crop_box
-    pad_left = max(0, -crop_x0)
-    pad_top = max(0, -crop_y0)
-    pad_right = max(0, crop_x1 - int(image.shape[2]))
-    pad_bottom = max(0, crop_y1 - int(image.shape[1]))
-    if pad_left or pad_top or pad_right or pad_bottom:
-        image, selection_mask, _context_mask = _pad_image_and_masks(
-            image,
-            selection_mask,
-            context_mask,
-            pad_left,
-            pad_top,
-            pad_right,
-            pad_bottom,
-        )
-        orig_box = (orig_box[0] + pad_left, orig_box[1] + pad_top, orig_box[2], orig_box[3])
     canvas_to_orig = orig_box
-    crop_to_canvas = (crop_x0 + pad_left, crop_y0 + pad_top, crop_x1 - crop_x0, crop_y1 - crop_y0)
+    crop_to_canvas = (crop_x0, crop_y0, crop_x1 - crop_x0, crop_y1 - crop_y0)
 
     ctc_x, ctc_y, ctc_w, ctc_h = crop_to_canvas
     content_image = image[:, ctc_y : ctc_y + ctc_h, ctc_x : ctc_x + ctc_w, :]
     content_mask = selection_mask[:, ctc_y : ctc_y + ctc_h, ctc_x : ctc_x + ctc_w].float()
     crop_support_canvas = content_mask.clone()
-
-    if output_resize_to_target_size:
-        algorithm = upscale_algorithm if requested_content_w >= ctc_w and requested_content_h >= ctc_h else downscale_algorithm
-        content_image = _resize_image(content_image, requested_content_w, requested_content_h, algorithm)
-        content_mask = _resize_mask_nearest(content_mask, requested_content_w, requested_content_h)
-
-    cropped_image, cropped_mask, output_content_box = _pad_output_to_multiple(content_image, content_mask, int(output_padding))
+    cropped_image = content_image
+    cropped_mask = content_mask
+    output_content_box = (0, 0, ctc_w, ctc_h)
     blend_mask = _inward_blend_mask(cropped_mask > 0.5, int(mask_blend_pixels))
 
     return SingleCropResult(
@@ -477,27 +241,9 @@ def run_zero_drift_crop(
     image: torch.Tensor,
     downscale_algorithm: str,
     upscale_algorithm: str,
-    preresize: bool,
-    preresize_mode: str,
-    preresize_min_width: int,
-    preresize_min_height: int,
-    preresize_max_width: int,
-    preresize_max_height: int,
-    extend_for_outpainting: bool,
-    extend_up_factor: float,
-    extend_down_factor: float,
-    extend_left_factor: float,
-    extend_right_factor: float,
-    mask_hipass_filter: float,
-    mask_fill_holes: bool,
     mask_expand_pixels: int,
-    mask_invert: bool,
     mask_blend_pixels: int,
     context_from_mask_extend_factor: float,
-    output_resize_to_target_size: bool,
-    output_target_width: int,
-    output_target_height: int,
-    output_padding: int,
     mask: torch.Tensor | None,
     optional_context_mask: torch.Tensor | None,
 ) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
@@ -506,9 +252,6 @@ def run_zero_drift_crop(
     optional_context_mask = _ensure_mask_shape(_clone_or_none(optional_context_mask), image)
     image, mask = _match_batch(image, mask)
     image, optional_context_mask = _match_batch(image, optional_context_mask)
-
-    if image.shape[0] > 1 and not output_resize_to_target_size:
-        raise AssertionError("output_resize_to_target_size must be enabled for image batches")
 
     stitcher = {
         "downscale_algorithm": downscale_algorithm,
@@ -539,27 +282,9 @@ def run_zero_drift_crop(
             optional_context_mask=optional_context_mask[index : index + 1],
             downscale_algorithm=downscale_algorithm,
             upscale_algorithm=upscale_algorithm,
-            preresize=preresize,
-            preresize_mode=preresize_mode,
-            preresize_min_width=preresize_min_width,
-            preresize_min_height=preresize_min_height,
-            preresize_max_width=preresize_max_width,
-            preresize_max_height=preresize_max_height,
-            extend_for_outpainting=extend_for_outpainting,
-            extend_up_factor=extend_up_factor,
-            extend_down_factor=extend_down_factor,
-            extend_left_factor=extend_left_factor,
-            extend_right_factor=extend_right_factor,
-            mask_hipass_filter=mask_hipass_filter,
-            mask_fill_holes=mask_fill_holes,
             mask_expand_pixels=mask_expand_pixels,
-            mask_invert=mask_invert,
             mask_blend_pixels=mask_blend_pixels,
             context_from_mask_extend_factor=context_from_mask_extend_factor,
-            output_resize_to_target_size=output_resize_to_target_size,
-            output_target_width=output_target_width,
-            output_target_height=output_target_height,
-            output_padding=output_padding,
         )
         stitcher["canvas_image"].append(result.canvas_image.cpu())
         stitcher["canvas_to_orig_x"].append(result.canvas_to_orig[0])

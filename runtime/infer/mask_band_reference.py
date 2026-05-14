@@ -66,6 +66,45 @@ def extract_mask_neighborhood_pixels(
     return outputs
 
 
+def extract_mask_neighborhood_strip_rgba(
+    image: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    outer_band_px: int,
+    mask_threshold: float = 0.5,
+) -> torch.Tensor:
+    if image.ndim != 4:
+        raise ValueError(f"Expected image BHWC tensor, got {tuple(image.shape)}")
+    if image.shape[-1] < 3:
+        raise ValueError("Expected image with at least 3 channels")
+    if mask.ndim not in {3, 4}:
+        raise ValueError(f"Expected mask BHW or B1HW tensor, got {tuple(mask.shape)}")
+    if outer_band_px <= 0:
+        raise ValueError("outer_band_px must be > 0")
+
+    height, width = int(image.shape[1]), int(image.shape[2])
+    mask = _resize_mask(mask, height, width)
+    image, mask = _match_batch(image, mask)
+
+    outputs: list[torch.Tensor] = []
+    for index in range(image.shape[0]):
+        mask_np = (mask[index].detach().cpu().numpy() > float(mask_threshold)).astype(np.uint8)
+        if int(mask_np.sum()) == 0:
+            raise ValueError("Mask has no active pixels")
+        outside = mask_np == 0
+        dist_to_mask = distance_transform_edt(outside)
+        band = outside & (dist_to_mask > 0.0) & (dist_to_mask <= float(outer_band_px))
+        if not np.any(band):
+            raise ValueError("Mask neighborhood is empty for the requested outer_band_px")
+
+        band_tensor = torch.from_numpy(band).to(device=image.device, dtype=image.dtype)
+        rgb = image[index][..., :3]
+        alpha = band_tensor.unsqueeze(-1)
+        rgba = torch.cat((rgb * alpha, alpha), dim=-1)
+        outputs.append(rgba)
+    return torch.stack(outputs, dim=0)
+
+
 def pack_reference_pixels(
     pixels_per_item: list[torch.Tensor],
     *,
@@ -118,3 +157,32 @@ def build_mask_band_reference_image(
         min_output_size=min_output_size,
         max_output_size=max_output_size,
     )
+
+
+def build_mask_band_reference_outputs(
+    image: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    outer_band_px: int,
+    min_output_size: int,
+    max_output_size: int,
+    mask_threshold: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pixels = extract_mask_neighborhood_pixels(
+        image,
+        mask,
+        outer_band_px=outer_band_px,
+        mask_threshold=mask_threshold,
+    )
+    reference = pack_reference_pixels(
+        pixels,
+        min_output_size=min_output_size,
+        max_output_size=max_output_size,
+    )
+    debug_strip = extract_mask_neighborhood_strip_rgba(
+        image,
+        mask,
+        outer_band_px=outer_band_px,
+        mask_threshold=mask_threshold,
+    )
+    return reference, debug_strip

@@ -22,44 +22,68 @@ def _gradient_image(height: int, width: int) -> torch.Tensor:
     return torch.cat([x, y, (x + y) * 0.5], dim=-1).float()
 
 
-def test_round_trip_is_exact_without_resize_or_blend() -> None:
+def _crop(
+    image: torch.Tensor,
+    mask: torch.Tensor | None,
+    optional_context_mask: torch.Tensor | None = None,
+    *,
+    mask_expand_pixels: int = 0,
+    mask_blend_pixels: int = 0,
+    context_from_mask_extend_factor: float = 1.0,
+) -> tuple[dict, torch.Tensor, torch.Tensor]:
+    node = ZeroDriftInpaintCropNode()
+    return node.inpaint_crop(
+        image,
+        "bilinear",
+        "bicubic",
+        mask_expand_pixels,
+        mask_blend_pixels,
+        context_from_mask_extend_factor,
+        mask,
+        optional_context_mask,
+    )
+
+
+def test_removed_ui_fields_are_not_exposed() -> None:
+    required = ZeroDriftInpaintCropNode.INPUT_TYPES()["required"]
+    removed_fields = {
+        "preresize",
+        "preresize_mode",
+        "preresize_min_width",
+        "preresize_min_height",
+        "preresize_max_width",
+        "preresize_max_height",
+        "mask_fill_holes",
+        "mask_invert",
+        "mask_hipass_filter",
+        "extend_for_outpainting",
+        "extend_up_factor",
+        "extend_down_factor",
+        "extend_left_factor",
+        "extend_right_factor",
+        "output_resize_to_target_size",
+        "output_target_width",
+        "output_target_height",
+        "output_padding",
+        "device_mode",
+    }
+    assert removed_fields.isdisjoint(required.keys())
+
+
+def test_round_trip_is_exact_without_blend() -> None:
     image = _gradient_image(101, 157)
     mask = torch.zeros((1, 101, 157), dtype=torch.float32)
     mask[:, 20:61, 40:96] = 1.0
 
-    crop = ZeroDriftInpaintCropNode()
     stitch = ZeroDriftInpaintStitchNode()
-    stitcher, cropped_image, _cropped_mask = crop.inpaint_crop(
+    stitcher, cropped_image, _cropped_mask = _crop(
         image,
-        "bilinear",
-        "bicubic",
-        False,
-        "ensure minimum resolution",
-        1024,
-        1024,
-        4096,
-        4096,
-        False,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        0.1,
-        True,
-        0,
-        False,
-        0,
-        1.2,
-        False,
-        512,
-        512,
-        "0",
-        "cpu (deterministic)",
         mask,
-        None,
+        context_from_mask_extend_factor=1.0,
     )
     restored, = stitch.inpaint_stitch(stitcher, cropped_image)
     assert torch.equal(restored, image)
+    assert cropped_image.shape[1:3] == (41, 56)
 
 
 def test_blend_mask_never_changes_pixels_outside_selection() -> None:
@@ -67,36 +91,12 @@ def test_blend_mask_never_changes_pixels_outside_selection() -> None:
     mask = torch.zeros((1, 101, 157), dtype=torch.float32)
     mask[:, 20:61, 40:96] = 1.0
 
-    crop = ZeroDriftInpaintCropNode()
     stitch = ZeroDriftInpaintStitchNode()
-    stitcher, cropped_image, _cropped_mask = crop.inpaint_crop(
+    stitcher, cropped_image, _cropped_mask = _crop(
         image,
-        "bilinear",
-        "bicubic",
-        False,
-        "ensure minimum resolution",
-        1024,
-        1024,
-        4096,
-        4096,
-        False,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        0.1,
-        True,
-        0,
-        False,
-        32,
-        1.2,
-        True,
-        512,
-        512,
-        "32",
-        "cpu (deterministic)",
         mask,
-        None,
+        mask_blend_pixels=32,
+        context_from_mask_extend_factor=1.2,
     )
     restored, = stitch.inpaint_stitch(stitcher, cropped_image)
     diff = (restored - image).abs()
@@ -104,115 +104,34 @@ def test_blend_mask_never_changes_pixels_outside_selection() -> None:
     assert float(outside.max()) == 0.0
 
 
-def test_output_padding_does_not_change_crop_geometry() -> None:
+def test_mask_expand_pixels_enlarges_crop_geometry() -> None:
     image = _gradient_image(101, 157)
     mask = torch.zeros((1, 101, 157), dtype=torch.float32)
     mask[:, 20:61, 40:96] = 1.0
-    crop = ZeroDriftInpaintCropNode()
 
-    stitcher_no_pad, _image_a, _mask_a = crop.inpaint_crop(
+    stitcher_base, _image_a, _mask_a = _crop(
         image,
-        "bilinear",
-        "bicubic",
-        False,
-        "ensure minimum resolution",
-        1024,
-        1024,
-        4096,
-        4096,
-        False,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        0.1,
-        True,
-        0,
-        False,
-        0,
-        1.2,
-        True,
-        513,
-        512,
-        "0",
-        "cpu (deterministic)",
         mask,
-        None,
     )
-    stitcher_pad, _image_b, _mask_b = crop.inpaint_crop(
+    stitcher_expanded, _image_b, _mask_b = _crop(
         image,
-        "bilinear",
-        "bicubic",
-        False,
-        "ensure minimum resolution",
-        1024,
-        1024,
-        4096,
-        4096,
-        False,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        0.1,
-        True,
-        0,
-        False,
-        0,
-        1.2,
-        True,
-        513,
-        512,
-        "32",
-        "cpu (deterministic)",
         mask,
-        None,
+        mask_expand_pixels=3,
     )
 
-    keys = [
-        "cropped_to_canvas_x",
-        "cropped_to_canvas_y",
-        "cropped_to_canvas_w",
-        "cropped_to_canvas_h",
-    ]
-    for key in keys:
-        assert stitcher_no_pad[key] == stitcher_pad[key]
+    assert stitcher_expanded["cropped_to_canvas_w"][0] > stitcher_base["cropped_to_canvas_w"][0]
+    assert stitcher_expanded["cropped_to_canvas_h"][0] > stitcher_base["cropped_to_canvas_h"][0]
 
 
 def test_single_stitcher_can_drive_mask_batch() -> None:
     image = _gradient_image(64, 96)
     mask = torch.zeros((1, 64, 96), dtype=torch.float32)
     mask[:, 16:48, 24:72] = 1.0
-    crop = ZeroDriftInpaintCropNode()
     stitch = ZeroDriftInpaintStitchNode()
-    stitcher, cropped_image, _cropped_mask = crop.inpaint_crop(
+
+    stitcher, cropped_image, _cropped_mask = _crop(
         image,
-        "bilinear",
-        "bicubic",
-        False,
-        "ensure minimum resolution",
-        1024,
-        1024,
-        4096,
-        4096,
-        False,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        0.1,
-        True,
-        0,
-        False,
-        0,
-        1.0,
-        True,
-        256,
-        256,
-        "0",
-        "cpu (deterministic)",
         mask,
-        None,
     )
 
     duplicated = torch.cat([cropped_image, cropped_image], dim=0)
@@ -224,37 +143,11 @@ def test_single_stitcher_can_drive_mask_batch() -> None:
 def test_empty_mask_falls_back_to_full_image_without_drift() -> None:
     image = _gradient_image(73, 111)
     mask = torch.zeros((1, 73, 111), dtype=torch.float32)
-    crop = ZeroDriftInpaintCropNode()
     stitch = ZeroDriftInpaintStitchNode()
 
-    stitcher, cropped_image, cropped_mask = crop.inpaint_crop(
+    stitcher, cropped_image, cropped_mask = _crop(
         image,
-        "bilinear",
-        "bicubic",
-        False,
-        "ensure minimum resolution",
-        1024,
-        1024,
-        4096,
-        4096,
-        False,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        0.1,
-        True,
-        0,
-        False,
-        0,
-        1.0,
-        False,
-        512,
-        512,
-        "0",
-        "cpu (deterministic)",
         mask,
-        None,
     )
     restored, = stitch.inpaint_stitch(stitcher, cropped_image)
     assert torch.equal(restored, image)
@@ -267,37 +160,12 @@ def test_optional_context_mask_enlarges_crop_but_round_trip_stays_exact() -> Non
     context = torch.zeros((1, 128, 160), dtype=torch.float32)
     mask[:, 40:72, 48:80] = 1.0
     context[:, 20:100, 24:120] = 1.0
-
-    crop = ZeroDriftInpaintCropNode()
     stitch = ZeroDriftInpaintStitchNode()
-    stitcher, cropped_image, _cropped_mask = crop.inpaint_crop(
+
+    stitcher, cropped_image, _cropped_mask = _crop(
         image,
-        "bilinear",
-        "bicubic",
-        False,
-        "ensure minimum resolution",
-        1024,
-        1024,
-        4096,
-        4096,
-        False,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        0.1,
-        True,
-        0,
-        False,
-        0,
-        1.0,
-        False,
-        512,
-        512,
-        "0",
-        "cpu (deterministic)",
         mask,
-        context,
+        optional_context_mask=context,
     )
     restored, = stitch.inpaint_stitch(stitcher, cropped_image)
     assert torch.equal(restored, image)
@@ -305,121 +173,16 @@ def test_optional_context_mask_enlarges_crop_but_round_trip_stays_exact() -> Non
     assert stitcher["cropped_to_canvas_h"][0] > 32
 
 
-def test_outpaint_extend_keeps_original_region_exact_on_identity_round_trip() -> None:
-    image = _gradient_image(96, 144)
-    mask = torch.zeros((1, 96, 144), dtype=torch.float32)
-    mask[:, :, 120:] = 1.0
-
-    crop = ZeroDriftInpaintCropNode()
-    stitch = ZeroDriftInpaintStitchNode()
-    stitcher, cropped_image, _cropped_mask = crop.inpaint_crop(
-        image,
-        "bilinear",
-        "bicubic",
-        False,
-        "ensure minimum resolution",
-        1024,
-        1024,
-        4096,
-        4096,
-        True,
-        1.0,
-        1.0,
-        1.0,
-        2.0,
-        0.0,
-        False,
-        0,
-        False,
-        0,
-        1.15,
-        False,
-        1536,
-        512,
-        "0",
-        "cpu (deterministic)",
-        mask,
-        None,
-    )
-    restored, = stitch.inpaint_stitch(stitcher, cropped_image)
-    assert torch.equal(restored, image)
-
-
-def test_preresize_keeps_single_pixel_mask_discrete() -> None:
-    image = _gradient_image(16, 16)
-    mask = torch.zeros((1, 16, 16), dtype=torch.float32)
-    mask[:, 8, 8] = 1.0
-    crop = ZeroDriftInpaintCropNode()
-
-    _stitcher, _cropped_image, cropped_mask = crop.inpaint_crop(
-        image,
-        "bilinear",
-        "bicubic",
-        True,
-        "ensure minimum resolution",
-        64,
-        64,
-        4096,
-        4096,
-        False,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        0.1,
-        False,
-        0,
-        False,
-        0,
-        1.0,
-        False,
-        64,
-        64,
-        "0",
-        "cpu (deterministic)",
-        mask,
-        None,
-    )
-    unique = set(torch.unique(cropped_mask).tolist())
-    assert unique.issubset({0.0, 1.0})
-    assert int(cropped_mask.sum().item()) >= 1
-
-
 def test_large_blend_radius_does_not_crash_on_small_crop() -> None:
     image = _gradient_image(64, 96)
     mask = torch.zeros((1, 64, 96), dtype=torch.float32)
     mask[:, 20:24, 40:44] = 1.0
-    crop = ZeroDriftInpaintCropNode()
     stitch = ZeroDriftInpaintStitchNode()
 
-    stitcher, cropped_image, _cropped_mask = crop.inpaint_crop(
+    stitcher, cropped_image, _cropped_mask = _crop(
         image,
-        "bilinear",
-        "bicubic",
-        False,
-        "ensure minimum resolution",
-        1024,
-        1024,
-        4096,
-        4096,
-        False,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        0.1,
-        True,
-        0,
-        False,
-        48,
-        1.0,
-        True,
-        64,
-        64,
-        "32",
-        "cpu (deterministic)",
         mask,
-        None,
+        mask_blend_pixels=48,
     )
     restored, = stitch.inpaint_stitch(stitcher, cropped_image)
     outside = ((restored - image).abs() * (1.0 - mask.unsqueeze(-1))).max().item()

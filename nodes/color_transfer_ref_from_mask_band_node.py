@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..runtime.infer.mask_band_reference import build_mask_band_reference_image
+from ..runtime.infer.mask_band_reference import build_mask_band_reference_outputs
 
 
 class ColorTransferRefFromMaskBandNode:
@@ -17,14 +17,14 @@ class ColorTransferRefFromMaskBandNode:
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("reference_image",)
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("reference_image", "debug_strip_image")
     FUNCTION = "build"
     CATEGORY = "image/postprocessing"
-    DESCRIPTION = "Build a dense reference image for ColorTransfer from pixels in a band around the mask."
+    DESCRIPTION = "Build a dense reference image for ColorTransfer from pixels in a band around the mask, plus an RGBA debug strip preview of the sampled band."
 
     def build(self, image, mask, outer_band_px, min_output_size, max_output_size, mask_threshold):
-        reference = build_mask_band_reference_image(
+        reference, debug_strip = build_mask_band_reference_outputs(
             image,
             mask,
             outer_band_px=int(outer_band_px),
@@ -32,4 +32,4 @@ class ColorTransferRefFromMaskBandNode:
             max_output_size=int(max_output_size),
             mask_threshold=float(mask_threshold),
         )
-        return (reference,)
+        return reference, debug_strip
