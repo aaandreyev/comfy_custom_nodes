@@ -7,6 +7,7 @@ from .seam_harmonizer_node import SeamHarmonizerV3Node
 from .draw_mask_overlay_advanced_node import DrawMaskOverlayAdvancedNode
 from .color_transfer_ref_from_mask_band_node import ColorTransferRefFromMaskBandNode
 from .zero_drift_inpaint_crop_stitch_node import ZeroDriftInpaintCropNode, ZeroDriftInpaintStitchNode
+from .masked_color_transfer_node import MaskedColorTransferNode
 
 try:
     from .flux2_klein_spatial_denoise_ksampler_node import Flux2KleinSpatialDenoiseKSamplerNode
@@ -29,6 +30,7 @@ __all__ = [
     "ColorTransferRefFromMaskBandNode",
     "ZeroDriftInpaintCropNode",
     "ZeroDriftInpaintStitchNode",
+    "MaskedColorTransferNode",
 ]
 
 if Flux2KleinSpatialDenoiseKSamplerNode is not None:

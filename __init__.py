@@ -9,6 +9,7 @@ from .nodes.seam_harmonizer_node import SeamHarmonizerV3Node
 from .nodes.draw_mask_overlay_advanced_node import DrawMaskOverlayAdvancedNode
 from .nodes.color_transfer_ref_from_mask_band_node import ColorTransferRefFromMaskBandNode
 from .nodes.zero_drift_inpaint_crop_stitch_node import ZeroDriftInpaintCropNode, ZeroDriftInpaintStitchNode
+from .nodes.masked_color_transfer_node import MaskedColorTransferNode
 from .nodes import SeamGuidedKSamplerNode
 
 try:
@@ -28,6 +29,7 @@ NODE_CLASS_MAPPINGS = {
     "ColorTransferRefFromMaskBand": ColorTransferRefFromMaskBandNode,
     "ZeroDriftInpaintCrop": ZeroDriftInpaintCropNode,
     "ZeroDriftInpaintStitch": ZeroDriftInpaintStitchNode,
+    "MaskedColorTransfer": MaskedColorTransferNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -41,6 +43,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ColorTransferRefFromMaskBand": "Color Transfer Ref From Mask Band",
     "ZeroDriftInpaintCrop": "Zero Drift Inpaint Crop",
     "ZeroDriftInpaintStitch": "Zero Drift Inpaint Stitch",
+    "MaskedColorTransfer": "Masked Color Transfer",
 }
 
 if Flux2KleinSpatialDenoiseKSamplerNode is not None:
