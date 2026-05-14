@@ -4,6 +4,8 @@ from .neighbor_tone_match_node import NeighborToneMatchNode
 from .poisson_inpaint_prefill import PoissonInpaintPrefill
 from .seam_latent_anchor_node import SeamLatentAnchorNode
 from .seam_harmonizer_node import SeamHarmonizerV3Node
+from .draw_mask_overlay_advanced_node import DrawMaskOverlayAdvancedNode
+from .color_transfer_ref_from_mask_band_node import ColorTransferRefFromMaskBandNode
 from .zero_drift_inpaint_crop_stitch_node import ZeroDriftInpaintCropNode, ZeroDriftInpaintStitchNode
 
 try:
@@ -23,6 +25,8 @@ __all__ = [
     "PoissonInpaintPrefill",
     "SeamLatentAnchorNode",
     "SeamHarmonizerV3Node",
+    "DrawMaskOverlayAdvancedNode",
+    "ColorTransferRefFromMaskBandNode",
     "ZeroDriftInpaintCropNode",
     "ZeroDriftInpaintStitchNode",
 ]

@@ -6,6 +6,8 @@ from .nodes.neighbor_tone_match_node import NeighborToneMatchNode
 from .nodes.poisson_inpaint_prefill import PoissonInpaintPrefill
 from .nodes.seam_latent_anchor_node import SeamLatentAnchorNode
 from .nodes.seam_harmonizer_node import SeamHarmonizerV3Node
+from .nodes.draw_mask_overlay_advanced_node import DrawMaskOverlayAdvancedNode
+from .nodes.color_transfer_ref_from_mask_band_node import ColorTransferRefFromMaskBandNode
 from .nodes.zero_drift_inpaint_crop_stitch_node import ZeroDriftInpaintCropNode, ZeroDriftInpaintStitchNode
 from .nodes import SeamGuidedKSamplerNode
 
@@ -22,6 +24,8 @@ NODE_CLASS_MAPPINGS = {
     "NeighborToneMatch": NeighborToneMatchNode,
     "SeamLatentAnchor": SeamLatentAnchorNode,
     "SeamHarmonizerV3": SeamHarmonizerV3Node,
+    "DrawMaskOverlayAdvanced": DrawMaskOverlayAdvancedNode,
+    "ColorTransferRefFromMaskBand": ColorTransferRefFromMaskBandNode,
     "ZeroDriftInpaintCrop": ZeroDriftInpaintCropNode,
     "ZeroDriftInpaintStitch": ZeroDriftInpaintStitchNode,
 }
@@ -33,6 +37,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NeighborToneMatch": "Neighbor Tone Match",
     "SeamLatentAnchor": "Seam Latent Anchor",
     "SeamHarmonizerV3": "Seam Harmonizer v3",
+    "DrawMaskOverlayAdvanced": "Draw Mask Overlay Advanced",
+    "ColorTransferRefFromMaskBand": "Color Transfer Ref From Mask Band",
     "ZeroDriftInpaintCrop": "Zero Drift Inpaint Crop",
     "ZeroDriftInpaintStitch": "Zero Drift Inpaint Stitch",
 }
