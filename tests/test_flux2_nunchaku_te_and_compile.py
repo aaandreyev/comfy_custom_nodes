@@ -191,3 +191,12 @@ def test_clip_compile_node_wraps_inner_forward_in_place():
     wrapped_fwd = inner.forward
     (out2,) = Flux2CLIPCompile().apply(out, True, "inductor", "default", True, compile_fn=_marking_compile)
     assert out2.cond_stage_model.qwen3_8b.transformer.forward is wrapped_fwd
+
+
+def test_shim_hides_inner_model_from_module_tree():
+    inner = _FakeQwen()
+    shim = NunchakuKleinTEShim(inner)
+    # hidden from ModelPatcher: no registered params/submodules -> no fp32 casts, no device moves
+    assert list(shim.parameters()) == [] and list(shim.children()) == []
+    assert shim.inner is inner  # still reachable for encode + Flux2CLIPCompile ("inner" path)
+    assert shim.dtypes == set()  # comfy.sd.CLIP iterates .dtypes

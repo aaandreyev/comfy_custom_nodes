@@ -60,15 +60,23 @@ def tokens_to_tensor(token_weight_pairs, embedding_key: str = "qwen3_8b"):
 
 
 class NunchakuKleinTEShim(nn.Module):
-    """Duck-typed comfy ``cond_stage_model`` around a nunchaku Qwen3 text-encoder runtime."""
+    """Duck-typed comfy ``cond_stage_model`` around a nunchaku Qwen3 text-encoder runtime.
+
+    The quantized inner model is deliberately kept OUT of the nn.Module tree
+    (``object.__setattr__``): comfy's CLIP wraps the cond_stage_model in a ModelPatcher that
+    force-casts float params to its compute dtype (fp32) and moves them across devices — both
+    would corrupt/derail the AWQ int4 runtime (bf16 scales, packed int16 qweights). Hidden from
+    the patcher, the inner model stays resident on the device the loader put it on (~3 GiB).
+    """
 
     def __init__(self, inner, layers=DEFAULT_LAYERS, pad_token: int = PAD_TOKEN,
                  embedding_key: str = "qwen3_8b"):
         super().__init__()
-        self.inner = inner
+        object.__setattr__(self, "inner", inner)  # bypass nn.Module registration
         self.layers = tuple(layers)
         self.pad_token = pad_token
         self.embedding_key = embedding_key
+        self.dtypes = set()  # comfy.sd.CLIP iterates this for cast-support checks
 
     # comfy CLIP options plumbing (layer overrides don't apply here) -------------------------
     def set_clip_options(self, options):
@@ -137,22 +145,24 @@ class NunchakuQwen3TELoader:
         if hasattr(inner, "eval"):
             inner.eval()
 
-        shim_holder = {}
-
         class _Target:
-            class clip:  # noqa: N801 — comfy instantiates target.clip(device=..., dtype=..., model_options=...)
+            # comfy.sd.CLIP contract: target.params dict (merged with device/dtype/model_options),
+            # target.clip class, target.tokenizer class.
+            params = {}
+
+            class clip:  # noqa: N801 — comfy instantiates target.clip(**params, device=..., dtype=..., model_options=...)
                 def __new__(cls, device="cpu", dtype=None, model_options={}):
-                    shim = NunchakuKleinTEShim(inner)
-                    shim_holder["shim"] = shim
-                    return shim
+                    return NunchakuKleinTEShim(inner)
 
             tokenizer = KleinTokenizer8B
 
-        params = sum(p.numel() for p in inner.parameters()) if hasattr(inner, "parameters") else 0
+        # parameters=0 on purpose: the inner quantized model is hidden from the ModelPatcher
+        # (see NunchakuKleinTEShim docstring), so comfy must not budget/move anything.
         clip = comfy.sd.CLIP(
             _Target,
             embedding_directory=folder_paths.get_folder_paths("embeddings"),
-            parameters=params,
+            parameters=0,
         )
-        logger.info("Nunchaku Qwen3 TE loaded from %s (%.1fM params visible)", te_name, params / 1e6)
+        n = sum(p.numel() for p in inner.parameters()) if hasattr(inner, "parameters") else 0
+        logger.info("Nunchaku Qwen3 TE loaded from %s (%.0fM params, resident on %s)", te_name, n / 1e6, device)
         return (clip,)
