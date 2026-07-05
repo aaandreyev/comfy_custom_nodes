@@ -8,6 +8,7 @@ from .draw_mask_overlay_advanced_node import DrawMaskOverlayAdvancedNode
 from .color_transfer_ref_from_mask_band_node import ColorTransferRefFromMaskBandNode
 from .zero_drift_inpaint_crop_stitch_node import ZeroDriftInpaintCropNode, ZeroDriftInpaintStitchNode
 from .masked_color_transfer_node import MaskedColorTransferNode
+from .flux2_active_region_rope_offset_node import Flux2ActiveRegionRoPEOffset
 
 try:
     from .flux2_klein_spatial_denoise_ksampler_node import Flux2KleinSpatialDenoiseKSamplerNode

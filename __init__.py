@@ -10,6 +10,7 @@ from .nodes.draw_mask_overlay_advanced_node import DrawMaskOverlayAdvancedNode
 from .nodes.color_transfer_ref_from_mask_band_node import ColorTransferRefFromMaskBandNode
 from .nodes.zero_drift_inpaint_crop_stitch_node import ZeroDriftInpaintCropNode, ZeroDriftInpaintStitchNode
 from .nodes.masked_color_transfer_node import MaskedColorTransferNode
+from .nodes.flux2_active_region_rope_offset_node import Flux2ActiveRegionRoPEOffset
 from .nodes import SeamGuidedKSamplerNode
 
 try:
@@ -30,6 +31,7 @@ NODE_CLASS_MAPPINGS = {
     "ZeroDriftInpaintCrop": ZeroDriftInpaintCropNode,
     "ZeroDriftInpaintStitch": ZeroDriftInpaintStitchNode,
     "MaskedColorTransfer": MaskedColorTransferNode,
+    "Flux2ActiveRegionRoPEOffset": Flux2ActiveRegionRoPEOffset,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -44,6 +46,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ZeroDriftInpaintCrop": "Zero Drift Inpaint Crop",
     "ZeroDriftInpaintStitch": "Zero Drift Inpaint Stitch",
     "MaskedColorTransfer": "Masked Color Transfer",
+    "Flux2ActiveRegionRoPEOffset": "Flux2 Active Region RoPE Offset (FCG)",
 }
 
 if Flux2KleinSpatialDenoiseKSamplerNode is not None:
