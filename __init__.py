@@ -11,6 +11,8 @@ from .nodes.color_transfer_ref_from_mask_band_node import ColorTransferRefFromMa
 from .nodes.zero_drift_inpaint_crop_stitch_node import ZeroDriftInpaintCropNode, ZeroDriftInpaintStitchNode
 from .nodes.masked_color_transfer_node import MaskedColorTransferNode
 from .nodes.flux2_active_region_rope_offset_node import Flux2ActiveRegionRoPEOffset
+from .nodes.flux2_compile_nodes import Flux2CLIPCompile, NunchakuFlux2ModelCompile
+from .nodes.flux2_nunchaku_te_loader_node import NunchakuQwen3TELoader
 from .nodes import SeamGuidedKSamplerNode
 
 try:
@@ -32,6 +34,9 @@ NODE_CLASS_MAPPINGS = {
     "ZeroDriftInpaintStitch": ZeroDriftInpaintStitchNode,
     "MaskedColorTransfer": MaskedColorTransferNode,
     "Flux2ActiveRegionRoPEOffset": Flux2ActiveRegionRoPEOffset,
+    "Flux2CLIPCompile": Flux2CLIPCompile,
+    "NunchakuFlux2ModelCompile": NunchakuFlux2ModelCompile,
+    "NunchakuQwen3TELoader": NunchakuQwen3TELoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -47,6 +52,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ZeroDriftInpaintStitch": "Zero Drift Inpaint Stitch",
     "MaskedColorTransfer": "Masked Color Transfer",
     "Flux2ActiveRegionRoPEOffset": "Flux2 Active Region RoPE Offset (FCG)",
+    "Flux2CLIPCompile": "Flux2 CLIP Compile",
+    "NunchakuFlux2ModelCompile": "Nunchaku FLUX.2 Model Compile (per-block)",
+    "NunchakuQwen3TELoader": "Nunchaku Qwen3 Text Encoder Loader (FLUX.2 klein)",
 }
 
 if Flux2KleinSpatialDenoiseKSamplerNode is not None:

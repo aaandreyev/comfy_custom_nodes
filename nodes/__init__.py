@@ -9,6 +9,8 @@ from .color_transfer_ref_from_mask_band_node import ColorTransferRefFromMaskBand
 from .zero_drift_inpaint_crop_stitch_node import ZeroDriftInpaintCropNode, ZeroDriftInpaintStitchNode
 from .masked_color_transfer_node import MaskedColorTransferNode
 from .flux2_active_region_rope_offset_node import Flux2ActiveRegionRoPEOffset
+from .flux2_compile_nodes import Flux2CLIPCompile, NunchakuFlux2ModelCompile
+from .flux2_nunchaku_te_loader_node import NunchakuQwen3TELoader
 
 try:
     from .flux2_klein_spatial_denoise_ksampler_node import Flux2KleinSpatialDenoiseKSamplerNode
