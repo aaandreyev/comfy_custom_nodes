@@ -66,6 +66,14 @@ QKV_GROUPS = {
 }
 
 
+def is_svdquant_checkpoint(keys) -> bool:
+    """Nunchaku SVDQuant exports keep diffusers-style module paths but pack quantized params
+    (qweight / wscales / smooth / proj_down / proj_up). They must NOT be converted — they are
+    loaded by the Nunchaku FLUX.2 DiT Loader node, never by UNETLoader."""
+    markers = (".qweight", ".wscales", ".proj_down", ".proj_up", ".smooth")
+    return any(k.endswith(markers) or any(m in k for m in markers) for k in keys)
+
+
 def is_native_layout(keys) -> bool:
     return any(k.startswith("img_in.") or k.startswith("double_blocks.") for k in keys)
 
@@ -153,6 +161,12 @@ def convert_file(src: str, dst: str | None = None) -> str:
 
     with safe_open(src, framework="pt", device="cpu") as f:
         keys = list(f.keys())
+        if is_svdquant_checkpoint(keys):
+            print(
+                f"{src}: Nunchaku SVDQuant checkpoint — SKIPPING (not convertible and must not be). "
+                "Load it with the 'Nunchaku FLUX.2 DiT Loader' node (a *_nunchaku workflow), not UNETLoader."
+            )
+            return src
         if is_native_layout(keys):
             print(f"{src}: already BFL-native layout, nothing to do")
             return src

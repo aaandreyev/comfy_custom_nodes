@@ -190,3 +190,17 @@ def test_unknown_block_key_raises():
         assert "some_new_thing" in str(e)
     else:
         raise AssertionError("expected KeyError for unmapped block key")
+
+
+def test_svdquant_checkpoint_is_detected():
+    from comfy_custom_nodes_repo.tools.convert_flux2_diffusers_to_native import is_svdquant_checkpoint
+
+    svdq_keys = [
+        "transformer_blocks.0.attn.to_qkv.qweight",
+        "transformer_blocks.0.attn.to_qkv.wscales",
+        "transformer_blocks.0.attn.to_qkv.proj_down",
+        "single_transformer_blocks.0.qkv_proj.smooth",
+    ]
+    assert is_svdquant_checkpoint(svdq_keys)
+    assert not is_svdquant_checkpoint(list(fake_native_sd()))
+    assert not is_svdquant_checkpoint(list(official_native_to_diffusers(fake_native_sd())))
