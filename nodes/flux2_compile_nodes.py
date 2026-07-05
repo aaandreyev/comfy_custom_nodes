@@ -95,27 +95,35 @@ class NunchakuFlux2ModelCompile:
         return (model,)
 
 
-_CLIP_INNER_PATHS = (
-    "qwen3_8b.transformer",   # comfy fp8 klein TE (Qwen3-8B)
-    "qwen3_4b.transformer",   # klein 4B TE
-    "mistral3_24b.transformer",  # flux2 dev TE
-    "inner",                  # NunchakuKleinTEShim (int4 TE)
-)
-
-
 def resolve_clip_inner(cond_stage_model):
-    """Find the heavy LLM submodule inside a comfy cond_stage_model. Returns (path, module)."""
-    for path in _CLIP_INNER_PATHS:
-        obj = cond_stage_model
-        ok = True
-        for part in path.split("."):
-            if not hasattr(obj, part):
-                ok = False
-                break
-            obj = getattr(obj, part)
-        if ok:
-            return path, obj
+    """Find the heavy LLM submodule inside a comfy cond_stage_model. Returns (path, module).
+
+    Resolution order: the NunchakuKleinTEShim's ``inner``; the attribute SD1ClipModel itself
+    records in ``.clip`` (e.g. "qwen3_8b"); finally any direct child that carries a
+    ``.transformer`` — so renames in upstream comfy don't break this node.
+    """
+    if hasattr(cond_stage_model, "inner"):
+        return "inner", cond_stage_model.inner
+
+    candidates = []
+    recorded = getattr(cond_stage_model, "clip", None)
+    if isinstance(recorded, str):
+        candidates.append(recorded)
+    if hasattr(cond_stage_model, "named_children"):
+        candidates.extend(name for name, _ in cond_stage_model.named_children())
+
+    for name in candidates:
+        sub = getattr(cond_stage_model, name, None)
+        if sub is not None and hasattr(sub, "transformer"):
+            return f"{name}.transformer", sub.transformer
     return None, None
+
+
+def describe_cond_stage_model(cond_stage_model) -> str:
+    kids = []
+    if hasattr(cond_stage_model, "named_children"):
+        kids = [name for name, _ in cond_stage_model.named_children()]
+    return f"{type(cond_stage_model).__name__} (children: {kids or 'none'})"
 
 
 class Flux2CLIPCompile:
@@ -143,7 +151,13 @@ class Flux2CLIPCompile:
             return (clip,)
         path, inner = resolve_clip_inner(clip.cond_stage_model)
         if inner is None:
-            raise ValueError("No known LLM submodule found in this CLIP (expected a FLUX.2 klein/dev text encoder).")
+            raise ValueError(
+                "No LLM submodule found in this CLIP — got "
+                f"{describe_cond_stage_model(clip.cond_stage_model)}. Expected a FLUX.2 klein/dev "
+                "text encoder. Most common cause: the Load CLIP widget silently fell back to a "
+                "different file (e.g. svdq-int4-Qwen3-text) because qwen_3_8b_fp8mixed.safetensors "
+                "is missing from models/text_encoders."
+            )
         if getattr(inner, "_flux2_compiled", False):
             return (clip,)
         # Wrap the bound forward, not the module — keeps the module tree (and every name-keyed

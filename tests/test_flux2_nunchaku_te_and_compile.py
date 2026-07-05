@@ -149,7 +149,8 @@ def test_model_compile_node_rejects_non_nunchaku():
 
 
 def test_clip_compile_resolves_fp8_and_shim_paths():
-    fp8_csm = SimpleNamespace(qwen3_8b=SimpleNamespace(transformer=nn.Linear(2, 2)))
+    # SD1ClipModel records its submodule attr in .clip — the resolver must use it
+    fp8_csm = SimpleNamespace(clip="qwen3_8b", qwen3_8b=SimpleNamespace(transformer=nn.Linear(2, 2)))
     path, inner = resolve_clip_inner(fp8_csm)
     assert path == "qwen3_8b.transformer" and isinstance(inner, nn.Linear)
 
@@ -158,9 +159,31 @@ def test_clip_compile_resolves_fp8_and_shim_paths():
     assert path == "inner" and isinstance(inner, _FakeQwen)
 
 
+def test_clip_compile_resolves_via_named_children_fallback():
+    class CSM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.renamed_te = nn.Module()
+            self.renamed_te.transformer = nn.Linear(2, 2)
+
+    path, inner = resolve_clip_inner(CSM())
+    assert path == "renamed_te.transformer" and isinstance(inner, nn.Linear)
+
+
+def test_clip_compile_unresolvable_error_names_children():
+    class Alien(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.something_768 = nn.Linear(2, 2)
+
+    clip = SimpleNamespace(cond_stage_model=Alien())
+    with pytest.raises(ValueError, match="something_768"):
+        Flux2CLIPCompile().apply(clip, True, "inductor", "default", True, compile_fn=_marking_compile)
+
+
 def test_clip_compile_node_wraps_inner_forward_in_place():
     lin = nn.Linear(2, 2)
-    clip = SimpleNamespace(cond_stage_model=SimpleNamespace(qwen3_8b=SimpleNamespace(transformer=lin)))
+    clip = SimpleNamespace(cond_stage_model=SimpleNamespace(clip="qwen3_8b", qwen3_8b=SimpleNamespace(transformer=lin)))
     (out,) = Flux2CLIPCompile().apply(clip, True, "inductor", "default", True, compile_fn=_marking_compile)
     inner = out.cond_stage_model.qwen3_8b.transformer
     assert inner is lin  # module identity preserved (ModelPatcher paths intact)
