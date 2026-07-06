@@ -3,7 +3,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from ..runtime.infer.neighbor_tone_match import apply_freeform_neighbor_tone_match, write_neighbor_tone_debug
+from ..runtime.infer.neighbor_tone_match import (
+    apply_freeform_neighbor_tone_match,
+    resolve_compute_device,
+    write_neighbor_tone_debug,
+)
 
 
 class FreeformNeighborToneMatchNode:
@@ -25,7 +29,8 @@ class FreeformNeighborToneMatchNode:
                 "v_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.05}),
                 "bins": ("INT", {"default": 32, "min": 4, "max": 128, "step": 1}),
                 "correction_mode": (["hybrid", "additive", "multiplicative"], {"default": "hybrid"}),
-                "lut_mode": (["3d", "2d_luma_curve"], {"default": "3d"}),
+                "lut_mode": (["3d", "2d_luma_curve"], {"default": "3d",
+                             "tooltip": "3d=full YUV LUT (luma-dependent chroma, needs dense samples); 2d_luma_curve=1D luma curve + 2D chroma LUT — denser statistics per bin (smoother color at high bins) and cheaper to build. Switch freely to compare visually."}),
                 "color_space": (["srgb", "linear"], {"default": "srgb"}),
                 "yuv_matrix": (["bt709", "bt601"], {"default": "bt709"}),
                 "delta_smoothing_sigma": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 16.0, "step": 0.25}),
@@ -61,8 +66,11 @@ class FreeformNeighborToneMatchNode:
         if reference_image.shape != image.shape:
             raise ValueError("reference_image and image must have the same shape")
 
-        ref_bchw = reference_image.permute(0, 3, 1, 2).contiguous()
-        img_bchw = image.permute(0, 3, 1, 2).contiguous()
+        out_device = image.device
+        device = resolve_compute_device() or out_device
+
+        ref_bchw = reference_image.permute(0, 3, 1, 2).contiguous().to(device)
+        img_bchw = image.permute(0, 3, 1, 2).contiguous().to(device)
         ref_rgb = ref_bchw[:, :3]
         img_rgb = img_bchw[:, :3]
         alpha = img_bchw[:, 3:] if img_bchw.shape[1] > 3 else None
@@ -71,6 +79,7 @@ class FreeformNeighborToneMatchNode:
             mask_t = mask.unsqueeze(1).float()
         else:
             mask_t = mask.float()
+        mask_t = mask_t.to(device)
         if mask_t.shape[-2:] != img_rgb.shape[-2:]:
             mask_t = F.interpolate(mask_t, size=img_rgb.shape[-2:], mode="nearest")
 
@@ -101,4 +110,4 @@ class FreeformNeighborToneMatchNode:
         if debug_previews:
             write_neighbor_tone_debug(ref_rgb, img_rgb, corrected_rgb, debug)
         corrected = torch.cat([corrected_rgb, alpha], dim=1) if alpha is not None else corrected_rgb
-        return (corrected.permute(0, 2, 3, 1).contiguous(),)
+        return (corrected.permute(0, 2, 3, 1).contiguous().to(out_device),)

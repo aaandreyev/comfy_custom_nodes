@@ -3,7 +3,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from ..runtime.infer.neighbor_tone_match import apply_neighbor_tone_match, write_neighbor_tone_debug
+from ..runtime.infer.neighbor_tone_match import (
+    apply_neighbor_tone_match,
+    resolve_compute_device,
+    write_neighbor_tone_debug,
+)
 
 
 class NeighborToneMatchNode:
@@ -32,7 +36,7 @@ class NeighborToneMatchNode:
                 "correction_mode": (["hybrid", "additive", "multiplicative"], {"default": "hybrid",
                                      "tooltip": "hybrid=multiplicative luma + additive chroma (best); additive=pure YUV delta; multiplicative=full ratio"}),
                 "lut_mode": (["3d", "2d_luma_curve"], {"default": "3d",
-                             "tooltip": "3d=full YUV LUT; 2d_luma_curve=compact 2D chroma LUT + 1D luma curve."}),
+                             "tooltip": "3d=full YUV LUT (luma-dependent chroma, needs dense samples); 2d_luma_curve=1D luma curve + 2D chroma LUT — denser statistics per bin (smoother color at high bins) and cheaper to build. Switch freely to compare visually."}),
                 "color_space": (["srgb", "linear"], {"default": "srgb",
                                   "tooltip": "srgb=linearise before correction, re-encode after; linear=no gamma handling"}),
                 "yuv_matrix": (["bt709", "bt601"], {"default": "bt709",
@@ -82,8 +86,11 @@ class NeighborToneMatchNode:
         if reference_image.shape != image.shape:
             raise ValueError("reference_image and image must have the same shape")
 
-        ref_bchw = reference_image.permute(0, 3, 1, 2).contiguous()
-        img_bchw = image.permute(0, 3, 1, 2).contiguous()
+        out_device = image.device
+        device = resolve_compute_device() or out_device
+
+        ref_bchw = reference_image.permute(0, 3, 1, 2).contiguous().to(device)
+        img_bchw = image.permute(0, 3, 1, 2).contiguous().to(device)
         ref_rgb = ref_bchw[:, :3]
         img_rgb = img_bchw[:, :3]
         alpha = img_bchw[:, 3:] if img_bchw.shape[1] > 3 else None
@@ -92,6 +99,9 @@ class NeighborToneMatchNode:
             mask_t = mask.unsqueeze(1).float()
         else:
             mask_t = mask.float()
+        mask_t = mask_t.to(device)
+        if topology_mask is not None:
+            topology_mask = topology_mask.to(device)
         if mask_t.shape[-2:] != img_rgb.shape[-2:]:
             mask_t = F.interpolate(mask_t, size=img_rgb.shape[-2:], mode="nearest")
 
@@ -131,4 +141,4 @@ class NeighborToneMatchNode:
         if debug_previews:
             write_neighbor_tone_debug(ref_rgb, img_rgb, corrected_rgb, debug)
         corrected = torch.cat([corrected_rgb, alpha], dim=1) if alpha is not None else corrected_rgb
-        return (corrected.permute(0, 2, 3, 1).contiguous(),)
+        return (corrected.permute(0, 2, 3, 1).contiguous().to(out_device),)

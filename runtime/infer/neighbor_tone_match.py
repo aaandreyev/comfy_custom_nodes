@@ -16,6 +16,26 @@ from .merge_bands import merge_side_deltas
 from .seam_latent_anchor import _normalize_mask_like, _parse_present_positions, SIDE_TOPOLOGY
 
 
+def resolve_compute_device() -> torch.device | None:
+    """ComfyUI's torch device when available and non-CPU, else None.
+
+    Tone match math is pure tensor work; running it on the sampler GPU instead
+    of the CPU-resident IMAGE tensors is a large win. Callers move inputs to
+    this device and move the result back.
+    """
+    try:
+        from comfy import model_management
+    except Exception:
+        return None
+    try:
+        device = model_management.get_torch_device()
+    except Exception:
+        return None
+    if device is None or device.type == "cpu":
+        return None
+    return device
+
+
 # ---------------------------------------------------------------------------
 # Colour space helpers
 # ---------------------------------------------------------------------------
@@ -105,40 +125,34 @@ def _safe_ratio(
 # LUT: build, fill empty bins, lookup
 # ---------------------------------------------------------------------------
 
-def _fill_lut_nn(
-    correction: torch.Tensor,
+def _nearest_valid_fill(
+    values: torch.Tensor,
     valid: torch.Tensor,
-    sample_counts: torch.Tensor,
-    global_correction: torch.Tensor,
+    global_value: torch.Tensor,
 ) -> torch.Tensor:
-    """Fill empty LUT bins via sample-count-weighted neighbour expansion with global fallback."""
-    if valid.all():
-        return correction
+    """Fill invalid grid cells with the value of the exact nearest valid cell.
 
-    B, nb = correction.shape[0], correction.shape[1]
-    filled = correction.float().permute(0, 4, 1, 2, 3)
-    weights = sample_counts.float().unsqueeze(1)
-    cur_valid = valid.unsqueeze(1)
-    global_fallback = global_correction.float().view(B, 3, 1, 1, 1)
-
-    for _ in range(nb * 3):
-        if bool(cur_valid.all()):
-            break
-        expanded = F.max_pool3d(cur_valid.float(), kernel_size=3, stride=1, padding=1) > 0.5
-        newly = expanded & (~cur_valid)
-        if not bool(newly.any()):
-            break
-        pooled_weights = F.avg_pool3d(weights, 3, 1, 1) * 27.0
-        pooled_sum = F.avg_pool3d(filled * weights, 3, 1, 1) * 27.0
-        neighbour_mean = pooled_sum / pooled_weights.clamp_min(1e-8)
-        fallback = torch.where(pooled_weights > 0.0, neighbour_mean, global_fallback)
-        filled = torch.where(newly.expand_as(filled), fallback, filled)
-        weights = torch.where(newly, pooled_weights.clamp_min(1.0), weights)
-        cur_valid = expanded
-
-    remaining = ~cur_valid
-    filled = torch.where(remaining.expand_as(filled), global_fallback, filled)
-    return filled.permute(0, 2, 3, 4, 1).to(correction.dtype)
+    Single-pass EDT replaces the previous O(bins^4) iterative dilation.
+    values: [B, *grid, C]; valid: [B, *grid]; global_value: [B, C] is used only
+    when a batch element has no valid cells at all.
+    """
+    if bool(valid.all()):
+        return values
+    out = values.clone()
+    grid_ndim = valid.ndim - 1
+    for b in range(values.shape[0]):
+        v = valid[b]
+        if not bool(v.any()):
+            out[b] = global_value[b].to(values.dtype).view(*([1] * grid_ndim), -1)
+            continue
+        invalid_np = (~v).detach().cpu().numpy()
+        nearest = distance_transform_edt(invalid_np, return_indices=True, return_distances=False)
+        index = tuple(
+            torch.from_numpy(np.ascontiguousarray(axis)).long().to(values.device)
+            for axis in nearest
+        )
+        out[b] = values[b][index]
+    return out
 
 
 def _global_correction_from_samples(
@@ -229,12 +243,8 @@ def _build_delta_lookup(
         valid_chroma = counts_chroma > 0
         luma_curve = _safe_ratio(ref_luma_mean, drift_luma_mean) if mode != "additive" else (ref_luma_mean - drift_luma_mean)
         chroma_lookup = ref_chroma_mean - drift_chroma_mean if mode != "multiplicative" else _safe_ratio(ref_chroma_mean, drift_chroma_mean, signed=True)
-        luma_identity = torch.ones_like(luma_curve) if mode != "additive" else torch.zeros_like(luma_curve)
-        chroma_identity = torch.zeros_like(chroma_lookup) if mode != "multiplicative" else torch.ones_like(chroma_lookup)
-        luma_curve = torch.where(valid_luma.unsqueeze(-1), luma_curve, luma_identity)
-        chroma_lookup = torch.where(valid_chroma.unsqueeze(-1), chroma_lookup, chroma_identity)
-        luma_curve = _fill_curve_1d(luma_curve, valid_luma, counts_luma, global_correction[:, :1]).to(orig_dtype)
-        chroma_lookup = _fill_grid_2d(chroma_lookup, valid_chroma, counts_chroma, global_correction[:, 1:]).to(orig_dtype)
+        luma_curve = _nearest_valid_fill(luma_curve, valid_luma, global_correction[:, :1]).to(orig_dtype)
+        chroma_lookup = _nearest_valid_fill(chroma_lookup, valid_chroma, global_correction[:, 1:]).to(orig_dtype)
         return {
             "lut_mode": lut_mode,
             "luma_curve": luma_curve,
@@ -276,24 +286,16 @@ def _build_delta_lookup(
 
     if mode == "additive":
         correction = ref_mean - drift_mean
-        identity = torch.zeros_like(correction)
     elif mode == "multiplicative":
         luma_ratio = _safe_ratio(ref_mean[..., :1], drift_mean[..., :1])
         chroma_ratio = _safe_ratio(ref_mean[..., 1:], drift_mean[..., 1:], signed=True)
         correction = torch.cat([luma_ratio, chroma_ratio], dim=-1)
-        identity = torch.ones_like(correction)
     else:  # hybrid
         luma_ratio = _safe_ratio(ref_mean[..., :1], drift_mean[..., :1])
         chroma_delta = ref_mean[..., 1:] - drift_mean[..., 1:]
         correction = torch.cat([luma_ratio, chroma_delta], dim=-1)
-        identity = torch.zeros_like(correction)
-        identity[..., 0] = 1.0  # luma identity = ratio 1
 
-    # Pre-fill empty bins with identity so bins unreachable by NN expansion are neutral
-    correction = torch.where(valid.unsqueeze(-1), correction, identity)
-
-    # Nearest-neighbour fill: propagate valid-bin values into empty neighbours
-    correction = _fill_lut_nn(correction, valid, counts, global_correction)
+    correction = _nearest_valid_fill(correction, valid, global_correction)
 
     return {
         "correction": correction.to(orig_dtype),
@@ -303,68 +305,6 @@ def _build_delta_lookup(
         "matrix": matrix,
         "global_correction": global_correction.to(orig_dtype),
     }
-
-
-def _fill_curve_1d(
-    values: torch.Tensor,
-    valid: torch.Tensor,
-    sample_counts: torch.Tensor,
-    global_value: torch.Tensor,
-) -> torch.Tensor:
-    if bool(valid.all()):
-        return values
-    B, bins = valid.shape
-    filled = values.float().permute(0, 2, 1)
-    weights = sample_counts.float().unsqueeze(1)
-    cur_valid = valid.unsqueeze(1)
-    global_fallback = global_value.float().view(B, values.shape[-1], 1)
-    for _ in range(bins):
-        if bool(cur_valid.all()):
-            break
-        expanded = F.max_pool1d(cur_valid.float(), kernel_size=3, stride=1, padding=1) > 0.5
-        newly = expanded & (~cur_valid)
-        if not bool(newly.any()):
-            break
-        pooled_weights = F.avg_pool1d(weights, 3, 1, 1) * 3.0
-        pooled_sum = F.avg_pool1d(filled * weights, 3, 1, 1) * 3.0
-        neighbour_mean = pooled_sum / pooled_weights.clamp_min(1e-8)
-        fallback = torch.where(pooled_weights > 0.0, neighbour_mean, global_fallback)
-        filled = torch.where(newly.expand_as(filled), fallback, filled)
-        weights = torch.where(newly, pooled_weights.clamp_min(1.0), weights)
-        cur_valid = expanded
-    filled = torch.where((~cur_valid).expand_as(filled), global_fallback, filled)
-    return filled.permute(0, 2, 1).to(values.dtype)
-
-
-def _fill_grid_2d(
-    values: torch.Tensor,
-    valid: torch.Tensor,
-    sample_counts: torch.Tensor,
-    global_value: torch.Tensor,
-) -> torch.Tensor:
-    if bool(valid.all()):
-        return values
-    B, bins, _ = valid.shape
-    filled = values.float().permute(0, 3, 1, 2)
-    weights = sample_counts.float().unsqueeze(1)
-    cur_valid = valid.unsqueeze(1)
-    global_fallback = global_value.float().view(B, values.shape[-1], 1, 1)
-    for _ in range(bins * 2):
-        if bool(cur_valid.all()):
-            break
-        expanded = F.max_pool2d(cur_valid.float(), kernel_size=3, stride=1, padding=1) > 0.5
-        newly = expanded & (~cur_valid)
-        if not bool(newly.any()):
-            break
-        pooled_weights = F.avg_pool2d(weights, 3, 1, 1) * 9.0
-        pooled_sum = F.avg_pool2d(filled * weights, 3, 1, 1) * 9.0
-        neighbour_mean = pooled_sum / pooled_weights.clamp_min(1e-8)
-        fallback = torch.where(pooled_weights > 0.0, neighbour_mean, global_fallback)
-        filled = torch.where(newly.expand_as(filled), fallback, filled)
-        weights = torch.where(newly, pooled_weights.clamp_min(1.0), weights)
-        cur_valid = expanded
-    filled = torch.where((~cur_valid).expand_as(filled), global_fallback, filled)
-    return filled.permute(0, 2, 3, 1).to(values.dtype)
 
 
 def _lookup_delta(
@@ -682,6 +622,8 @@ def apply_neighbor_tone_match(
         else:
             mask = F.interpolate(mask, size=reference_rgb.shape[-2:], mode=interp_mode)
     soft_mask = mask.clamp(0.0, 1.0)
+    if soft_mask.shape[0] == 1 and reference_rgb.shape[0] > 1:
+        soft_mask = soft_mask.expand(reference_rgb.shape[0], -1, -1, -1)
     bbox = mask_bbox((soft_mask > 1e-3).to(dtype=image_dtype))
     x0, y0, x1, y1 = bbox
     present_positions = _parse_present_positions(
@@ -710,15 +652,30 @@ def apply_neighbor_tone_match(
             "topology_mask": _normalize_mask_like(topology_mask, reference_rgb.shape[-2:]) if topology_mask is not None else None,
         }
 
+    # Work on a crop around the mask bbox: bbox + outer_band on each side covers
+    # every pixel the correction can touch, so the result is identical to the
+    # full-frame computation while YUV conversion, band merge, and gamut
+    # compression all scale with the mask, not the frame.
+    height, width = reference_rgb.shape[-2:]
+    outer_width = int(inner_width if outer_band_px is None else outer_band_px)
+    pad = max(outer_width, 1)
+    cx0, cy0 = max(x0 - pad, 0), max(y0 - pad, 0)
+    cx1, cy1 = min(x1 + pad, width), min(y1 + pad, height)
+    bbox_c = (x0 - cx0, y0 - cy0, x1 - cx0, y1 - cy0)
+    ref_crop = reference_rgb[:, :, cy0:cy1, cx0:cx1]
+    drift_crop = drift_source_rgb[:, :, cy0:cy1, cx0:cx1]
+    gen_crop = generated_rgb[:, :, cy0:cy1, cx0:cx1]
+    mask_crop = soft_mask[:, :, cy0:cy1, cx0:cx1]
+
     # Optionally linearise before YUV conversion
     if color_space == "srgb":
-        ref_lin = _srgb_to_linear(reference_rgb)
-        drift_lin = _srgb_to_linear(drift_source_rgb)
-        gen_lin = _srgb_to_linear(generated_rgb)
+        ref_lin = _srgb_to_linear(ref_crop)
+        drift_lin = _srgb_to_linear(drift_crop)
+        gen_lin = _srgb_to_linear(gen_crop)
     else:
-        ref_lin = reference_rgb
-        drift_lin = drift_source_rgb
-        gen_lin = generated_rgb
+        ref_lin = ref_crop
+        drift_lin = drift_crop
+        gen_lin = gen_crop
 
     reference_yuv = _rgb_to_yuv(ref_lin, matrix=yuv_matrix)
     drift_source_yuv = _rgb_to_yuv(drift_lin, matrix=yuv_matrix)
@@ -729,9 +686,8 @@ def apply_neighbor_tone_match(
 
     side_deltas: dict[str, torch.Tensor] = {}
     per_side_meta: dict[str, dict] = {}
-    outer_width = int(inner_width if outer_band_px is None else outer_band_px)
-    reference_outer_samples = _gather_outer_samples_per_element(reference_yuv, soft_mask, sides, outer_width, bbox)
-    drift_outer_samples = _gather_outer_samples_per_element(drift_source_yuv, soft_mask, sides, outer_width, bbox)
+    reference_outer_samples = _gather_outer_samples_per_element(reference_yuv, mask_crop, sides, outer_width, bbox_c)
+    drift_outer_samples = _gather_outer_samples_per_element(drift_source_yuv, mask_crop, sides, outer_width, bbox_c)
     lookup = None
     if reference_outer_samples is not None and drift_outer_samples is not None:
         lookup = _build_delta_lookup(
@@ -743,12 +699,12 @@ def apply_neighbor_tone_match(
             matrix=yuv_matrix,
         )
     for side in sides:
-        generated_inner = _extract_inner_side_band(generated_yuv, bbox, side, int(inner_width))
+        generated_inner = _extract_inner_side_band(generated_yuv, bbox_c, side, int(inner_width))
         if lookup is None or generated_inner is None:
             continue
         delta_band = _lookup_delta(generated_inner, lookup) * channel_scale
         delta_band = _gaussian_blur_band(delta_band, float(delta_smoothing_sigma))
-        placed = _place_side_delta(delta_band, bbox, side, generated_yuv.shape)
+        placed = _place_side_delta(delta_band, bbox_c, side, generated_yuv.shape)
         side_deltas[side] = placed
         per_side_meta[side] = {
             "band_shape": [int(v) for v in generated_inner.shape[-2:]],
@@ -766,8 +722,8 @@ def apply_neighbor_tone_match(
 
     merged_delta, weights = merge_side_deltas(
         side_deltas,
-        soft_mask,
-        bbox=bbox,
+        mask_crop,
+        bbox=bbox_c,
         inner_width=int(inner_width),
         flat_top_px=int(inner_flat_top_px),
         corner_px=corner_px,
@@ -781,15 +737,17 @@ def apply_neighbor_tone_match(
     )
 
     if color_space == "srgb":
-        corrected_rgb = _linear_to_srgb(corrected_lin).clamp(0.0, 1.0)
+        corrected_crop = _linear_to_srgb(corrected_lin).clamp(0.0, 1.0)
     else:
-        corrected_rgb = corrected_lin
-    corrected_rgb = corrected_rgb * soft_mask + generated_rgb * (1.0 - soft_mask)
-    corrected_rgb = corrected_rgb.to(dtype=image_dtype)
+        corrected_crop = corrected_lin
+    corrected_crop = corrected_crop * mask_crop + gen_crop * (1.0 - mask_crop)
+    corrected_rgb = generated_rgb.clone()
+    corrected_rgb[:, :, cy0:cy1, cx0:cx1] = corrected_crop.to(dtype=image_dtype)
 
     return corrected_rgb, {
         "reason": "applied",
         "bbox": bbox,
+        "crop_offset": (cx0, cy0),
         "present_positions": tuple(sorted(present_positions)),
         "side_deltas": side_deltas,
         "weights": weights,
@@ -859,28 +817,42 @@ def apply_freeform_neighbor_tone_match(
         else:
             mask = F.interpolate(mask, size=reference_rgb.shape[-2:], mode=interp_mode)
     soft_mask = mask.clamp(0.0, 1.0)
+    if soft_mask.shape[0] == 1 and reference_rgb.shape[0] > 1:
+        soft_mask = soft_mask.expand(reference_rgb.shape[0], -1, -1, -1)
     bbox = mask_bbox((soft_mask > 1e-3).to(dtype=image_dtype))
 
-    if color_space == "srgb":
-        ref_yuv = _rgb_to_yuv(_srgb_to_linear(reference_rgb), matrix=yuv_matrix)
-        img_yuv = _rgb_to_yuv(_srgb_to_linear(image_rgb), matrix=yuv_matrix)
-    else:
-        ref_yuv = _rgb_to_yuv(reference_rgb, matrix=yuv_matrix)
-        img_yuv = _rgb_to_yuv(image_rgb, matrix=yuv_matrix)
-    channel_scale = ref_yuv.new_tensor([float(luma_strength), u_strength, v_strength]).view(1, 3, 1, 1)
-
-    corrected_batches: list[torch.Tensor] = []
+    channel_scale = reference_rgb.new_tensor([float(luma_strength), u_strength, v_strength]).view(1, 3, 1, 1)
+    corrected = image_rgb.clone()
     debug_items: list[dict] = []
     outer_width = int(inner_width if outer_band_px is None else outer_band_px)
+    margin = int(math.ceil(delta_smoothing_sigma * 3)) if delta_smoothing_sigma > 0.0 else 0
+    # Crop pad covers the outer donor band, the blur margin, and one pixel of
+    # guaranteed outside ring so both distance transforms stay exact on the crop.
+    pad = max(outer_width, margin, 1) + 1
+    height, width = reference_rgb.shape[-2:]
 
     for idx in range(reference_rgb.shape[0]):
-        mask_np = soft_mask[idx, 0].detach().cpu().numpy().astype(np.float32)
-        mask_bool = mask_np > 1e-3
-        if not np.any(mask_bool):
-            corrected_batches.append(image_rgb[idx : idx + 1])
+        active = soft_mask[idx, 0] > 1e-3
+        if not bool(active.any()):
             debug_items.append({"reason": "empty_mask", "bbox": bbox})
             continue
+        ys, xs = torch.where(active)
+        cy0 = max(int(ys.min()) - pad, 0)
+        cy1 = min(int(ys.max()) + 1 + pad, height)
+        cx0 = max(int(xs.min()) - pad, 0)
+        cx1 = min(int(xs.max()) + 1 + pad, width)
+        ref_crop = reference_rgb[idx : idx + 1, :, cy0:cy1, cx0:cx1]
+        img_crop = image_rgb[idx : idx + 1, :, cy0:cy1, cx0:cx1]
+        mask_crop = soft_mask[idx : idx + 1, :, cy0:cy1, cx0:cx1]
+        if color_space == "srgb":
+            ref_yuv = _rgb_to_yuv(_srgb_to_linear(ref_crop), matrix=yuv_matrix)
+            img_yuv = _rgb_to_yuv(_srgb_to_linear(img_crop), matrix=yuv_matrix)
+        else:
+            ref_yuv = _rgb_to_yuv(ref_crop, matrix=yuv_matrix)
+            img_yuv = _rgb_to_yuv(img_crop, matrix=yuv_matrix)
 
+        mask_np = mask_crop[0, 0].detach().cpu().numpy().astype(np.float32)
+        mask_bool = mask_np > 1e-3
         outside = ~mask_bool
         dist_out = distance_transform_edt(outside).astype(np.float32)
         dist_in = distance_transform_edt(mask_bool).astype(np.float32)
@@ -888,16 +860,15 @@ def apply_freeform_neighbor_tone_match(
         inner_band = mask_bool & (dist_in > 0.0) & (dist_in <= float(max(int(inner_width), 1)))
 
         if not np.any(outer_band):
-            corrected_batches.append(image_rgb[idx : idx + 1])
             debug_items.append({"reason": "no_outer_donor_samples", "bbox": bbox})
             continue
         if not np.any(inner_band):
-            corrected_batches.append(image_rgb[idx : idx + 1])
             debug_items.append({"reason": "no_inner_band", "bbox": bbox})
             continue
 
-        ref_samples = ref_yuv[idx : idx + 1, :, outer_band].reshape(1, 3, -1)
-        img_samples = img_yuv[idx : idx + 1, :, outer_band].reshape(1, 3, -1)
+        outer_band_t = torch.from_numpy(outer_band).to(device=ref_yuv.device)
+        ref_samples = ref_yuv[:, :, outer_band_t].reshape(1, 3, -1)
+        img_samples = img_yuv[:, :, outer_band_t].reshape(1, 3, -1)
         lookup = _build_delta_lookup(
             img_samples,
             ref_samples,
@@ -906,26 +877,25 @@ def apply_freeform_neighbor_tone_match(
             lut_mode=lut_mode,
             matrix=yuv_matrix,
         )
-        H, W = mask_bool.shape
+        ch, cw = mask_bool.shape
         rows_i, cols_i = np.where(inner_band)
-        margin = int(math.ceil(delta_smoothing_sigma * 3)) if delta_smoothing_sigma > 0.0 else 0
         r0 = max(int(rows_i.min()) - margin, 0)
-        r1 = min(int(rows_i.max()) + margin + 1, H)
+        r1 = min(int(rows_i.max()) + margin + 1, ch)
         c0 = max(int(cols_i.min()) - margin, 0)
-        c1 = min(int(cols_i.max()) + margin + 1, W)
-        gen_crop = img_yuv[idx : idx + 1, :, r0:r1, c0:c1]
-        delta_crop = _lookup_delta(gen_crop, lookup) * channel_scale
-        delta_crop = _gaussian_blur_band(delta_crop, float(delta_smoothing_sigma))
-        delta_full = torch.zeros(1, img_yuv.shape[1], H, W, device=img_yuv.device, dtype=img_yuv.dtype)
-        delta_full[:, :, r0:r1, c0:c1] = delta_crop
+        c1 = min(int(cols_i.max()) + margin + 1, cw)
+        gen_sub = img_yuv[:, :, r0:r1, c0:c1]
+        delta_sub = _lookup_delta(gen_sub, lookup) * channel_scale
+        delta_sub = _gaussian_blur_band(delta_sub, float(delta_smoothing_sigma))
+        delta_full = torch.zeros(1, img_yuv.shape[1], ch, cw, device=img_yuv.device, dtype=img_yuv.dtype)
+        delta_full[:, :, r0:r1, c0:c1] = delta_sub
 
         inner_weight_np = _freeform_inner_weight(
             dist_in,
             inner_width=int(inner_width),
             flat_top_px=int(inner_flat_top_px),
         ) * inner_band.astype(np.float32)
-        inner_weight = torch.from_numpy(inner_weight_np).to(device=delta_full.device, dtype=delta_full.dtype).view(1, 1, *mask_bool.shape)
-        corrected_yuv = img_yuv[idx : idx + 1] + delta_full * inner_weight * soft_mask[idx : idx + 1]
+        inner_weight = torch.from_numpy(inner_weight_np).to(device=delta_full.device, dtype=delta_full.dtype).view(1, 1, ch, cw)
+        corrected_yuv = img_yuv + delta_full * inner_weight * mask_crop
 
         neutral = corrected_yuv[:, :1].clamp(0.0, 1.0).expand(-1, 3, -1, -1)
         if color_space == "srgb":
@@ -936,19 +906,18 @@ def apply_freeform_neighbor_tone_match(
             corrected_rgb = _compress_to_unit_gamut(
                 _yuv_to_rgb(corrected_yuv, matrix=yuv_matrix), neutral
             )
-        corrected_rgb = corrected_rgb * soft_mask[idx : idx + 1] + image_rgb[idx : idx + 1] * (1.0 - soft_mask[idx : idx + 1])
-        corrected_rgb = corrected_rgb.to(dtype=image_dtype)
-        corrected_batches.append(corrected_rgb)
+        corrected_rgb = corrected_rgb * mask_crop + img_crop * (1.0 - mask_crop)
+        corrected[idx : idx + 1, :, cy0:cy1, cx0:cx1] = corrected_rgb.to(dtype=image_dtype)
         debug_items.append(
             {
                 "reason": "applied",
                 "bbox": bbox,
+                "crop": (cx0, cy0, cx1, cy1),
                 "outer_samples": int(outer_band.sum()),
                 "inner_pixels": int(inner_band.sum()),
             }
         )
 
-    corrected = torch.cat(corrected_batches, dim=0)
     return corrected, {
         "reason": "applied" if any(item.get("reason") == "applied" for item in debug_items) else debug_items[0]["reason"],
         "bbox": bbox,
