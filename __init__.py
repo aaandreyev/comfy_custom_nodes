@@ -13,6 +13,7 @@ from .nodes.masked_color_transfer_node import MaskedColorTransferNode
 from .nodes.flux2_active_region_rope_offset_node import Flux2ActiveRegionRoPEOffset
 from .nodes.flux2_compile_nodes import Flux2CLIPCompile, NunchakuFlux2ModelCompile
 from .nodes.flux2_nunchaku_te_loader_node import NunchakuQwen3TELoader
+from .nodes.seamfix_clip_text_encode_node import SeamfixCLIPTextEncode
 from .nodes import SeamGuidedKSamplerNode
 
 try:
@@ -37,6 +38,7 @@ NODE_CLASS_MAPPINGS = {
     "Flux2CLIPCompile": Flux2CLIPCompile,
     "NunchakuFlux2ModelCompile": NunchakuFlux2ModelCompile,
     "NunchakuQwen3TELoader": NunchakuQwen3TELoader,
+    "SeamfixCLIPTextEncode": SeamfixCLIPTextEncode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -55,6 +57,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Flux2CLIPCompile": "Flux2 CLIP Compile",
     "NunchakuFlux2ModelCompile": "Nunchaku FLUX.2 Model Compile (per-block)",
     "NunchakuQwen3TELoader": "Nunchaku Qwen3 Text Encoder Loader (FLUX.2 klein)",
+    "SeamfixCLIPTextEncode": "CLIP Text Encode (SEAMFIX / Inpaint Prompt)",
 }
 
 if Flux2KleinSpatialDenoiseKSamplerNode is not None:

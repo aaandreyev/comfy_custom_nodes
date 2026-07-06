@@ -11,6 +11,7 @@ from .masked_color_transfer_node import MaskedColorTransferNode
 from .flux2_active_region_rope_offset_node import Flux2ActiveRegionRoPEOffset
 from .flux2_compile_nodes import Flux2CLIPCompile, NunchakuFlux2ModelCompile
 from .flux2_nunchaku_te_loader_node import NunchakuQwen3TELoader
+from .seamfix_clip_text_encode_node import SeamfixCLIPTextEncode
 
 try:
     from .flux2_klein_spatial_denoise_ksampler_node import Flux2KleinSpatialDenoiseKSamplerNode
@@ -34,6 +35,7 @@ __all__ = [
     "ZeroDriftInpaintCropNode",
     "ZeroDriftInpaintStitchNode",
     "MaskedColorTransferNode",
+    "SeamfixCLIPTextEncode",
 ]
 
 if Flux2KleinSpatialDenoiseKSamplerNode is not None:
