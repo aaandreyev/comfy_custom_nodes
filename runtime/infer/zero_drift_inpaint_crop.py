@@ -211,6 +211,26 @@ def _align_crop_outputs_to_multiple_of_8(
     return resized_image, resized_mask, resized_blend, resized_support, tw, th
 
 
+def _compute_crop_box(
+    image: torch.Tensor,
+    mask: torch.Tensor,
+    optional_context_mask: torch.Tensor,
+    mask_expand_pixels: int,
+    context_from_mask_extend_factor: float,
+) -> tuple[int, int, int, int]:
+    selection_mask = _binary_mask_default(mask)
+    context_mask = _binary_mask_default(optional_context_mask)
+    if mask_expand_pixels > 0:
+        selection_mask = _dilate_mask(selection_mask, int(mask_expand_pixels))
+    bbox = _bbox_from_mask(selection_mask[0])
+    if bbox is None:
+        bbox = (0, 0, int(image.shape[2]), int(image.shape[1]))
+    if context_from_mask_extend_factor > 1.0:
+        bbox = _grow_bbox(bbox, float(context_from_mask_extend_factor))
+    bbox = _union_bbox(bbox, _bbox_from_mask(context_mask[0])) or bbox
+    return _clamp_bbox(bbox, int(image.shape[2]), int(image.shape[1]))
+
+
 @dataclass
 class SingleCropResult:
     canvas_image: torch.Tensor
@@ -234,19 +254,20 @@ def _prepare_single_crop(
     context_from_mask_extend_factor: float,
     *,
     align_crop_spatial_multiple_of_8: bool,
+    crop_box: tuple[int, int, int, int] | None = None,
 ) -> SingleCropResult:
     orig_box = (0, 0, int(image.shape[2]), int(image.shape[1]))
     selection_mask = _binary_mask_default(mask)
-    context_mask = _binary_mask_default(optional_context_mask)
     if mask_expand_pixels > 0:
         selection_mask = _dilate_mask(selection_mask, int(mask_expand_pixels))
-    bbox = _bbox_from_mask(selection_mask[0])
-    if bbox is None:
-        bbox = (0, 0, int(image.shape[2]), int(image.shape[1]))
-    if context_from_mask_extend_factor > 1.0:
-        bbox = _grow_bbox(bbox, float(context_from_mask_extend_factor))
-    bbox = _union_bbox(bbox, _bbox_from_mask(context_mask[0])) or bbox
-    crop_box = _clamp_bbox(bbox, int(image.shape[2]), int(image.shape[1]))
+    if crop_box is None:
+        crop_box = _compute_crop_box(
+            image,
+            mask,
+            optional_context_mask,
+            mask_expand_pixels,
+            context_from_mask_extend_factor,
+        )
     crop_x0, crop_y0, crop_x1, crop_y1 = crop_box
     canvas_to_orig = orig_box
     crop_to_canvas = (crop_x0, crop_y0, crop_x1 - crop_x0, crop_y1 - crop_y0)
@@ -329,6 +350,21 @@ def run_zero_drift_crop(
     cropped_images: list[torch.Tensor] = []
     cropped_masks: list[torch.Tensor] = []
 
+    # With batch > 1, per-element masks can produce different crop sizes, which
+    # cannot be stacked into one IMAGE batch. Share the union crop box so every
+    # element yields the same crop size; for batch 1 behavior is unchanged.
+    shared_crop_box: tuple[int, int, int, int] | None = None
+    if image.shape[0] > 1:
+        for index in range(image.shape[0]):
+            box = _compute_crop_box(
+                image[index : index + 1],
+                mask[index : index + 1],
+                optional_context_mask[index : index + 1],
+                mask_expand_pixels,
+                context_from_mask_extend_factor,
+            )
+            shared_crop_box = _union_bbox(shared_crop_box, box)
+
     for index in range(image.shape[0]):
         result = _prepare_single_crop(
             image=image[index : index + 1],
@@ -340,6 +376,7 @@ def run_zero_drift_crop(
             mask_blend_pixels=mask_blend_pixels,
             context_from_mask_extend_factor=context_from_mask_extend_factor,
             align_crop_spatial_multiple_of_8=align_crop_spatial_multiple_of_8,
+            crop_box=shared_crop_box,
         )
         stitcher["canvas_image"].append(result.canvas_image.cpu())
         stitcher["canvas_to_orig_x"].append(result.canvas_to_orig[0])

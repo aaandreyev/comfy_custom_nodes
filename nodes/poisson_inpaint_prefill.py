@@ -42,7 +42,8 @@ class PoissonInpaintPrefill:
             img_np = image[index].detach().cpu().numpy().astype("float64")
             height, width = img_np.shape[:2]
 
-            mask_tensor = mask[index] if mask.ndim == 3 else mask[index, 0]
+            mask_index = index % mask.shape[0]
+            mask_tensor = mask[mask_index] if mask.ndim == 3 else mask[mask_index, 0]
             geometry_cache_key = None
             if mask_tensor.device.type == "cpu" and mask_tensor.is_contiguous():
                 geometry_cache_key = ("torch_mask", tuple(mask_tensor.shape), int(mask_tensor.data_ptr()))
@@ -54,7 +55,8 @@ class PoissonInpaintPrefill:
 
             erase_np = None
             if erase_mask is not None:
-                erase_tensor = erase_mask[index] if erase_mask.ndim == 3 else erase_mask[index, 0]
+                erase_index = index % erase_mask.shape[0]
+                erase_tensor = erase_mask[erase_index] if erase_mask.ndim == 3 else erase_mask[erase_index, 0]
                 erase_np = erase_tensor.detach().cpu().numpy().astype("float32")
                 if erase_np.shape != (height, width):
                     erase_np = _resize_array(erase_np, width, height, 1).astype("float32")

@@ -65,13 +65,17 @@ def apply_corrector_to_full_frame(
     blend_falloff_px: int | None = None,
     stream_strengths: dict[str, float] | None = None,
 ) -> tuple[torch.Tensor, dict]:
-    outputs = extract_active_strips(image[0], bbox, sides, inner_width)
-    side_order = list(outputs.keys())
+    frames = int(image.shape[0])
+    per_frame_strips = [extract_active_strips(image[b], bbox, sides, inner_width) for b in range(frames)]
+    side_order = list(per_frame_strips[0].keys())
     if not side_order:
         return image, {"per_side": {}, "weights": {}, "side_deltas": {}, "merged_delta": torch.zeros_like(image)}
 
     outer_width = int(getattr(model, "outer_width", 128))
-    strip_batch = torch.stack([outputs[side]["strip"] for side in side_order], dim=0)
+    strip_batch = torch.stack(
+        [per_frame_strips[b][side]["strip"] for side in side_order for b in range(frames)],
+        dim=0,
+    )
     boundary_band_px = int(getattr(model, "boundary_band_px", 24))
     model_in = _canonical_model_input(strip_batch, outer_width, boundary_band_px=boundary_band_px).to(_model_device(model))
     # Any explicit UI value means "use geometric blending semantics from the node".
@@ -100,12 +104,13 @@ def apply_corrector_to_full_frame(
 
     side_deltas: dict[str, torch.Tensor] = {}
     for index, side in enumerate(side_order):
-        delta_inner = inner_delta[index : index + 1]
-        confidence_inner = inner_confidence[index : index + 1]
-        meta = outputs[side]["meta"]
+        start = index * frames
+        delta_inner = inner_delta[start : start + frames]
+        confidence_inner = inner_confidence[start : start + frames]
+        meta = per_frame_strips[0][side]["meta"]
         side_deltas[side] = _place_inner_map(delta_inner.to(image.device), image, bbox, side, inner_width, meta)
         debug["per_side"][side] = {
-            "edge_padded_pixels": outputs[side]["meta"]["edge_padded_pixels"],
+            "edge_padded_pixels": meta["edge_padded_pixels"],
             "confidence_mean": float(confidence_inner.mean().item()),
             "delta_abs_mean": float(delta_inner.abs().mean().item()),
         }

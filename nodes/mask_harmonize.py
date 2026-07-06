@@ -72,14 +72,16 @@ class MaskHarmonize:
                 alpha_np = None
                 img_np = (frame * 255).clip(0, 255).astype("uint8")
 
-            mask_tensor = mask[index] if mask.ndim == 3 else mask[index, 0]
+            mask_index = index % mask.shape[0]
+            mask_tensor = mask[mask_index] if mask.ndim == 3 else mask[mask_index, 0]
             mask_np = mask_tensor.detach().cpu().numpy().astype("float32")
             if mask_np.shape != (height, width):
                 mask_np = _resize_array(mask_np, width, height, 1).astype("float32")
 
             protect_np = None
             if protect_mask is not None:
-                protect_tensor = protect_mask[index] if protect_mask.ndim == 3 else protect_mask[index, 0]
+                protect_index = index % protect_mask.shape[0]
+                protect_tensor = protect_mask[protect_index] if protect_mask.ndim == 3 else protect_mask[protect_index, 0]
                 protect_np = protect_tensor.detach().cpu().numpy().astype("float32")
                 if protect_np.shape != (height, width):
                     protect_np = _resize_array(protect_np, width, height, 1).astype("float32")
