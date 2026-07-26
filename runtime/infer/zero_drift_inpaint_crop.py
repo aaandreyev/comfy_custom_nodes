@@ -177,16 +177,17 @@ def _clamp_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> tup
     return (x0, y0, max(x0, x1), max(y0, y1))
 
 
-def _nearest_multiple_of_8(x: int) -> int:
-    """Nearest positive multiple of 8 for spatial sizes (minimum 8)."""
+def _nearest_spatial_multiple(x: int, multiple: int) -> int:
+    """Nearest positive multiple for spatial sizes (minimum one multiple)."""
+    m = max(1, int(multiple))
     x = int(x)
     if x <= 0:
-        return 8
-    rounded = int(round(x / 8.0)) * 8
-    return max(8, rounded)
+        return m
+    rounded = int(round(x / float(m))) * m
+    return max(m, rounded)
 
 
-def _align_crop_outputs_to_multiple_of_8(
+def _align_crop_outputs_to_multiple(
     cropped_image: torch.Tensor,
     cropped_mask: torch.Tensor,
     blend_mask: torch.Tensor,
@@ -194,12 +195,13 @@ def _align_crop_outputs_to_multiple_of_8(
     *,
     natural_w: int,
     natural_h: int,
+    multiple: int,
     downscale_algorithm: str,
     upscale_algorithm: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    """Resize crop tensors so H,W are multiples of 8 for VAE-friendly inpainting."""
-    tw = _nearest_multiple_of_8(natural_w)
-    th = _nearest_multiple_of_8(natural_h)
+    """Resize crop tensors so H,W are multiples of the VAE spatial factor."""
+    tw = _nearest_spatial_multiple(natural_w, multiple)
+    th = _nearest_spatial_multiple(natural_h, multiple)
     if tw == natural_w and th == natural_h:
         return cropped_image, cropped_mask, blend_mask, crop_support_canvas, tw, th
     algo = upscale_algorithm if tw >= natural_w and th >= natural_h else downscale_algorithm
@@ -254,6 +256,7 @@ def _prepare_single_crop(
     context_from_mask_extend_factor: float,
     *,
     align_crop_spatial_multiple_of_8: bool,
+    spatial_size_multiple: int = 8,
     crop_box: tuple[int, int, int, int] | None = None,
 ) -> SingleCropResult:
     orig_box = (0, 0, int(image.shape[2]), int(image.shape[1]))
@@ -284,13 +287,14 @@ def _prepare_single_crop(
     out_w, out_h = int(ctc_w), int(ctc_h)
     if align_crop_spatial_multiple_of_8:
         cropped_image, cropped_mask_bin, blend_mask, crop_support_canvas, out_w, out_h = (
-            _align_crop_outputs_to_multiple_of_8(
+            _align_crop_outputs_to_multiple(
                 cropped_image,
                 cropped_mask_bin,
                 blend_mask,
                 crop_support_canvas,
                 natural_w=int(ctc_w),
                 natural_h=int(ctc_h),
+                multiple=int(spatial_size_multiple),
                 downscale_algorithm=downscale_algorithm,
                 upscale_algorithm=upscale_algorithm,
             )
@@ -321,6 +325,7 @@ def run_zero_drift_crop(
     mask: torch.Tensor | None,
     optional_context_mask: torch.Tensor | None,
     align_crop_spatial_multiple_of_8: bool = True,
+    spatial_size_multiple: int = 8,
 ) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
     image = image.clone()
     mask = _ensure_mask_shape(_clone_or_none(mask), image)
@@ -376,6 +381,7 @@ def run_zero_drift_crop(
             mask_blend_pixels=mask_blend_pixels,
             context_from_mask_extend_factor=context_from_mask_extend_factor,
             align_crop_spatial_multiple_of_8=align_crop_spatial_multiple_of_8,
+            spatial_size_multiple=spatial_size_multiple,
             crop_box=shared_crop_box,
         )
         stitcher["canvas_image"].append(result.canvas_image.cpu())
@@ -435,9 +441,34 @@ def stitch_zero_drift_result(
             expected_h = int(blend_mask_output.shape[1])
             expected_w = int(blend_mask_output.shape[2])
             if input_w != expected_w or input_h != expected_h:
-                raise AssertionError(
-                    f"Inpainted image shape {input_w}x{input_h} does not match expected output {expected_w}x{expected_h}"
-                )
+                short_w = expected_w - input_w
+                short_h = expected_h - input_h
+                vae_shaped = input_w % 8 == 0 and input_h % 8 == 0
+                if vae_shaped and 0 <= short_w <= 64 and 0 <= short_h <= 64:
+                    # VAE encode center-crops pixels to its spatial multiple (e.g. flux2
+                    # is /16), so the sampled result comes back smaller than the crop we
+                    # produced. Place it back at the same centered offset and keep the
+                    # blend away from the missing margins.
+                    off_x = short_w // 2
+                    off_y = short_h // 2
+                    padded = torch.zeros(
+                        (1, expected_h, expected_w, int(one_image.shape[-1])),
+                        device=one_image.device,
+                        dtype=one_image.dtype,
+                    )
+                    padded[:, off_y : off_y + input_h, off_x : off_x + input_w, :] = one_image
+                    validity = torch.zeros(
+                        (1, expected_h, expected_w),
+                        device=one_image.device,
+                        dtype=blend_mask_output.dtype,
+                    )
+                    validity[:, off_y : off_y + input_h, off_x : off_x + input_w] = 1.0
+                    one_image = padded
+                    blend_mask_output = blend_mask_output * validity
+                else:
+                    raise AssertionError(
+                        f"Inpainted image shape {input_w}x{input_h} does not match expected output {expected_w}x{expected_h}"
+                    )
             content_image = one_image[:, content_y : content_y + content_h, content_x : content_x + content_w, :]
             content_mask = blend_mask_output[:, content_y : content_y + content_h, content_x : content_x + content_w]
         if int(content_image.shape[2]) != ctc_w or int(content_image.shape[1]) != ctc_h:

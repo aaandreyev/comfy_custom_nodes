@@ -492,6 +492,7 @@ def test_crop_stitch_via_nodes_matches_runtime(algo_ds: str, algo_us: str) -> No
         True,
         mask,
         None,
+        vae_size_multiple=8,
     )
     restored_n, = stitch_node.inpaint_stitch(stitcher_n, cropped_n.clone())
 

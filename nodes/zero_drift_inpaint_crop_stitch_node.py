@@ -20,6 +20,9 @@ class ZeroDriftInpaintCropNode:
             "optional": {
                 "mask": ("MASK",),
                 "optional_context_mask": ("MASK",),
+                "vae_size_multiple": ("INT", {"default": 16, "min": 1, "max": 128, "step": 1,
+                                     "tooltip": "Spatial factor of the VAE in use: 16 for FLUX.2, 8 for SD-family. "
+                                                "Crop sizes are aligned to this multiple so VAEEncode does not crop pixels."}),
             },
         }
 
@@ -29,8 +32,8 @@ class ZeroDriftInpaintCropNode:
     CATEGORY = "inpaint"
     DESCRIPTION = (
         "Pixel-stable crop for inpainting. When enabled, resizes crop outputs to the nearest "
-        "width and height divisible by 8 for VAE-friendly latent grids; stitch maps back to the "
-        "original crop rectangle on the canvas."
+        "width and height divisible by vae_size_multiple (16 for FLUX.2 VAEs, 8 for SD-family) "
+        "for VAE-friendly latent grids; stitch maps back to the original crop rectangle on the canvas."
     )
 
     def inpaint_crop(
@@ -44,6 +47,7 @@ class ZeroDriftInpaintCropNode:
         vae_alignment_multiple_of_8,
         mask=None,
         optional_context_mask=None,
+        vae_size_multiple=16,
     ):
         stitcher, cropped_image, cropped_mask = run_zero_drift_crop(
             image=image,
@@ -55,6 +59,7 @@ class ZeroDriftInpaintCropNode:
             mask=mask,
             optional_context_mask=optional_context_mask,
             align_crop_spatial_multiple_of_8=vae_alignment_multiple_of_8,
+            spatial_size_multiple=int(vae_size_multiple),
         )
         return (stitcher, cropped_image, cropped_mask)
 

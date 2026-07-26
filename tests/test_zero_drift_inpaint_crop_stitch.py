@@ -97,7 +97,7 @@ def test_vae_alignment_disabled_keeps_natural_crop_shape_and_exact_round_trip() 
 def test_round_trip_is_exact_without_blend() -> None:
     image = _gradient_image(101, 157)
     mask = torch.zeros((1, 101, 157), dtype=torch.float32)
-    mask[:, 20:61, 40:96] = 1.0
+    mask[:, 20:68, 40:104] = 1.0
 
     stitch = ZeroDriftInpaintStitchNode()
     stitcher, cropped_image, _cropped_mask = _crop(
@@ -107,8 +107,8 @@ def test_round_trip_is_exact_without_blend() -> None:
     )
     restored, = stitch.inpaint_stitch(stitcher, cropped_image)
     _assert_rgb_close(restored, image)
-    assert cropped_image.shape[1] % 8 == 0 and cropped_image.shape[2] % 8 == 0
-    assert cropped_image.shape[1:3] == (40, 56)
+    assert cropped_image.shape[1] % 16 == 0 and cropped_image.shape[2] % 16 == 0
+    assert cropped_image.shape[1:3] == (48, 64)
 
 
 def test_blend_mask_never_changes_pixels_outside_selection() -> None:
@@ -213,3 +213,72 @@ def test_large_blend_radius_does_not_crash_on_small_crop() -> None:
     restored, = stitch.inpaint_stitch(stitcher, cropped_image)
     outside = ((restored - image).abs() * (1.0 - mask.unsqueeze(-1))).max().item()
     assert outside == 0.0
+
+
+def _vae_center_crop(image: torch.Tensor, multiple: int) -> torch.Tensor:
+    """comfy.sd.VAE.vae_encode_crop_pixels: symmetric crop of H,W down to a multiple."""
+    h = image.shape[1] // multiple * multiple
+    w = image.shape[2] // multiple * multiple
+    y0 = (image.shape[1] % multiple) // 2
+    x0 = (image.shape[2] % multiple) // 2
+    return image[:, y0 : y0 + h, x0 : x0 + w, :]
+
+
+def test_default_alignment_matches_flux2_vae_multiple_of_16() -> None:
+    image = _gradient_image(320, 320)
+    mask = torch.zeros(1, 320, 320)
+    mask[:, 10:186, 10:258] = 1.0
+    _, cropped_image, _ = _crop(image, mask)
+    assert cropped_image.shape[1] % 16 == 0
+    assert cropped_image.shape[2] % 16 == 0
+    assert _vae_center_crop(cropped_image, 16).shape == cropped_image.shape
+
+
+def test_stitch_accepts_vae16_center_cropped_result_from_legacy_multiple_of_8_crop() -> None:
+    image = _gradient_image(320, 320)
+    mask = torch.zeros(1, 320, 320)
+    mask[:, 10:186, 10:258] = 1.0
+    node = ZeroDriftInpaintCropNode()
+    stitcher, cropped_image, _ = node.inpaint_crop(
+        image,
+        "bilinear",
+        "bicubic",
+        0,
+        0,
+        1.0,
+        True,
+        mask,
+        None,
+        vae_size_multiple=8,
+    )
+    assert cropped_image.shape[1:3] == (176, 248)
+    decoded = _vae_center_crop(cropped_image, 16)
+    assert decoded.shape[1:3] == (176, 240)
+    inpainted = torch.full_like(decoded, 0.5)
+    result = ZeroDriftInpaintStitchNode().inpaint_stitch(stitcher, inpainted)[0]
+
+    assert result.shape == image.shape
+    outside = mask[0] <= 0.5
+    torch.testing.assert_close(result[:, outside, :], image[:, outside, :])
+    torch.testing.assert_close(
+        result[:, 20:170, 30:230, :], torch.full_like(result[:, 20:170, 30:230, :], 0.5)
+    )
+    left_margin = image[:, 10:186, 10:14, :]
+    torch.testing.assert_close(result[:, 10:186, 10:14, :], left_margin)
+
+
+def test_stitch_still_rejects_non_vae_shaped_mismatch() -> None:
+    image = _gradient_image(320, 320)
+    mask = torch.zeros(1, 320, 320)
+    mask[:, 10:186, 10:258] = 1.0
+    node = ZeroDriftInpaintCropNode()
+    stitcher, cropped_image, _ = node.inpaint_crop(
+        image, "bilinear", "bicubic", 0, 0, 1.0, True, mask, None, vae_size_multiple=8
+    )
+    bad = cropped_image[:, :, :-1, :]
+    try:
+        ZeroDriftInpaintStitchNode().inpaint_stitch(stitcher, bad)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("expected shape-mismatch AssertionError for non-VAE-shaped input")
