@@ -12,6 +12,7 @@ Usage:
   python warmup_compile_buckets.py --workflow inpaint_api.json --dry-run
   python warmup_compile_buckets.py --workflow inpaint_api.json --steps 1
   python warmup_compile_buckets.py --workflow inpaint_api.json --quick
+  python warmup_compile_buckets.py --workflow inpaint_api.json --host https://xxx.pinggy-free.link
 
 The bucket list must match ZeroDriftInpaintCrop settings (size_bucket_px /
 bucket_min_px): sides default to 512..2048 step 128-ish grid below.
@@ -19,13 +20,27 @@ bucket_min_px): sides default to 512..2048 step 128-ish grid below.
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import struct
 import time
 import urllib.request
 import uuid
 import zlib
+
+_UA = {"User-Agent": "warmup-compile-buckets/1.0"}
+
+
+def _normalize_host(host: str) -> str:
+    host = host.strip().rstrip("/")
+    if not host.startswith(("http://", "https://")):
+        host = "https://" + host
+    return host
+
+
+def _get_json(url: str, timeout: float = 60.0) -> dict:
+    req = urllib.request.Request(url, headers=dict(_UA))
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
 
 
 def build_shapes(sides: list[int], aspect_limit: float, strip_side: int, quick: bool) -> list[tuple[int, int]]:
@@ -72,22 +87,21 @@ def upload_png(host: str, name: str, payload: bytes) -> str:
     ).encode() + payload + f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"overwrite\"\r\n\r\ntrue\r\n--{boundary}--\r\n".encode()
     req = urllib.request.Request(
         f"{host}/upload/image", data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}", **_UA},
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:
         return json.loads(resp.read())["name"]
 
 
 def submit_and_wait(host: str, prompt: dict, timeout_s: float) -> float:
     payload = json.dumps({"prompt": prompt}).encode()
     req = urllib.request.Request(f"{host}/prompt", data=payload,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+                                 headers={"Content-Type": "application/json", **_UA})
+    with urllib.request.urlopen(req, timeout=120) as resp:
         prompt_id = json.loads(resp.read())["prompt_id"]
     started = time.monotonic()
     while time.monotonic() - started < timeout_s:
-        with urllib.request.urlopen(f"{host}/history/{prompt_id}", timeout=60) as resp:
-            history = json.loads(resp.read())
+        history = _get_json(f"{host}/history/{prompt_id}")
         entry = history.get(prompt_id)
         if entry:
             status = entry.get("status", {})
@@ -122,6 +136,12 @@ def main() -> None:
     if args.dry_run:
         return
 
+    host = _normalize_host(args.host)
+    stats = _get_json(f"{host}/system_stats")
+    device = (stats.get("devices") or [{}])[0]
+    print(f"connected to {host}: {device.get('name', '?')} "
+          f"vram_free={device.get('vram_free', 0) / 2 ** 30:.1f}GiB", flush=True)
+
     workflow = json.load(open(args.workflow))
     load_nodes = [nid for nid, n in workflow.items() if n["class_type"] == "LoadImage"]
     if len(load_nodes) != 1:
@@ -134,9 +154,9 @@ def main() -> None:
 
     total_started = time.monotonic()
     for i, (w, h) in enumerate(shapes, start=1):
-        name = upload_png(args.host, f"warmup_{w}x{h}.png", dummy_rgba_png(w, h))
+        name = upload_png(host, f"warmup_{w}x{h}.png", dummy_rgba_png(w, h))
         workflow[load_id]["inputs"]["image"] = name
-        elapsed = submit_and_wait(args.host, workflow, args.timeout)
+        elapsed = submit_and_wait(host, workflow, args.timeout)
         print(f"[{i}/{len(shapes)}] {w}x{h}: {elapsed:.1f}s", flush=True)
     print(f"done in {(time.monotonic() - total_started) / 60.0:.1f} min")
 
