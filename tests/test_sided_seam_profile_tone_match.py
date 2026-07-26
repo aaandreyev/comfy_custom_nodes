@@ -193,3 +193,24 @@ def test_node_wrapper_rejects_empty_mask() -> None:
             mask=torch.zeros(1, SIZE, SIZE),
             **_node_kwargs(),
         )
+
+
+def test_batched_image_with_single_reference() -> None:
+    base = _base_image()
+    mask = _right_half_mask()
+    imgs = np.stack([_biased_image(base, mask, -0.06), _biased_image(base, mask, 0.05)])
+    corrected, debug = apply_sided_seam_profile_tone_match(
+        _to_bchw(base),
+        torch.from_numpy(imgs).float(),
+        torch.from_numpy(mask).unsqueeze(0),
+        inner_width=32,
+        color_space="linear",
+        yuv_matrix="bt601",
+    )
+    assert debug["reason"] == "applied"
+    assert corrected.shape[0] == 2
+    band = torch.zeros(SIZE, SIZE, dtype=torch.bool)
+    band[:, SIZE // 2 : SIZE // 2 + 4] = True
+    imgs_t = torch.from_numpy(imgs).float()
+    assert (corrected[0, 0][band] - imgs_t[0, 0][band]).mean() > 0.005
+    assert (corrected[1, 0][band] - imgs_t[1, 0][band]).mean() < -0.005

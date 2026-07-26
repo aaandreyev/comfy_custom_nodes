@@ -140,8 +140,12 @@ def apply_seam_profile_tone_match(
 ) -> tuple[torch.Tensor, dict]:
     if reference_rgb.ndim != 4 or image_rgb.ndim != 4:
         raise ValueError("reference_rgb and image_rgb must be BCHW")
-    if reference_rgb.shape != image_rgb.shape:
-        raise ValueError("reference_rgb and image_rgb must have the same shape")
+    if reference_rgb.shape[1:] != image_rgb.shape[1:]:
+        raise ValueError("reference_rgb and image_rgb must have the same C,H,W")
+    if reference_rgb.shape[0] == 1 and image_rgb.shape[0] > 1:
+        reference_rgb = reference_rgb.expand(image_rgb.shape[0], -1, -1, -1)
+    elif reference_rgb.shape[0] != image_rgb.shape[0]:
+        raise ValueError("reference batch must be 1 or match the image batch")
 
     image_dtype = image_rgb.dtype
     out_device = image_rgb.device
@@ -274,8 +278,12 @@ def apply_sided_seam_profile_tone_match(
     """
     if reference_rgb.ndim != 4 or image_rgb.ndim != 4:
         raise ValueError("reference_rgb and image_rgb must be BCHW")
-    if reference_rgb.shape != image_rgb.shape:
-        raise ValueError("reference_rgb and image_rgb must have the same shape")
+    if reference_rgb.shape[1:] != image_rgb.shape[1:]:
+        raise ValueError("reference_rgb and image_rgb must have the same C,H,W")
+    if reference_rgb.shape[0] == 1 and image_rgb.shape[0] > 1:
+        reference_rgb = reference_rgb.expand(image_rgb.shape[0], -1, -1, -1)
+    elif reference_rgb.shape[0] != image_rgb.shape[0]:
+        raise ValueError("reference batch must be 1 or match the image batch")
 
     image_dtype = image_rgb.dtype
     out_device = image_rgb.device

@@ -124,6 +124,9 @@ def main() -> None:
     ap.add_argument("--quick", action="store_true",
                     help="Warm only squares and strip combos (fast subset).")
     ap.add_argument("--steps", type=int, default=1, help="Sampler steps override for warmup runs.")
+    ap.add_argument("--batch", type=int, default=1,
+                    help="Latent batch size to warm (torch.compile caches per batch size too). "
+                         "Sets `amount` on a RepeatLatentBatch feeding the sampler, inserting one if absent.")
     ap.add_argument("--timeout", type=float, default=900.0, help="Per-run timeout, seconds.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
@@ -147,10 +150,28 @@ def main() -> None:
     if len(load_nodes) != 1:
         raise SystemExit(f"expected exactly one LoadImage node, found {load_nodes}; adapt the script")
     load_id = load_nodes[0]
+    sampler_ids = []
     for nid, n in workflow.items():
         if "KSampler" in n["class_type"] and "steps" in n["inputs"]:
             print(f"override node {nid} steps {n['inputs']['steps']} -> {args.steps}")
             n["inputs"]["steps"] = int(args.steps)
+            sampler_ids.append(nid)
+
+    if args.batch > 1 or any(n["class_type"] == "RepeatLatentBatch" for n in workflow.values()):
+        repeats = [nid for nid, n in workflow.items() if n["class_type"] == "RepeatLatentBatch"]
+        if repeats:
+            for nid in repeats:
+                print(f"override node {nid} RepeatLatentBatch amount -> {args.batch}")
+                workflow[nid]["inputs"]["amount"] = int(args.batch)
+        else:
+            for nid in sampler_ids:
+                src = workflow[nid]["inputs"].get("latent_image")
+                if isinstance(src, list):
+                    new_id = f"warmup_batch_{nid}"
+                    workflow[new_id] = {"class_type": "RepeatLatentBatch",
+                                        "inputs": {"samples": src, "amount": int(args.batch)}}
+                    workflow[nid]["inputs"]["latent_image"] = [new_id, 0]
+                    print(f"inserted RepeatLatentBatch (amount {args.batch}) before sampler {nid}")
 
     total_started = time.monotonic()
     for i, (w, h) in enumerate(shapes, start=1):

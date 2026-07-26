@@ -236,3 +236,58 @@ def test_node_wrapper_rejects_empty_mask() -> None:
             yuv_matrix="bt601",
             debug_previews=False,
         )
+
+
+def test_batched_image_with_single_reference_and_mask() -> None:
+    base = _base_image()
+    mask = _circle_mask()
+    imgs = np.stack([
+        _biased_image(base, mask, -0.06),
+        _biased_image(base, mask, 0.05),
+        _biased_image(base, mask, -0.02),
+        _biased_image(base, mask, 0.03),
+    ])
+    corrected, debug = apply_seam_profile_tone_match(
+        _to_bchw(base),
+        torch.from_numpy(imgs).float(),
+        torch.from_numpy(mask).unsqueeze(0),
+        inner_width=48,
+        color_space="linear",
+        yuv_matrix="bt601",
+    )
+    assert debug["reason"] == "applied"
+    assert corrected.shape[0] == 4
+    band = torch.from_numpy(
+        (distance_transform_edt(mask > 0.5) <= 4) & (mask > 0.5)
+    )
+    imgs_t = torch.from_numpy(imgs).float()
+    for i, sign in enumerate((1, -1, 1, -1)):
+        delta = (corrected[i, 0][band] - imgs_t[i, 0][band]).mean()
+        assert sign * delta > 0.005, f"element {i}: correction sign wrong ({delta})"
+
+
+def test_node_wrapper_accepts_repeat_latent_batch_wiring() -> None:
+    base = _base_image()
+    mask = _circle_mask()
+    image = _biased_image(base, mask, -0.06)
+    node = SeamProfileToneMatchNode()
+    (out,) = node.run(
+        reference_image=torch.from_numpy(base).permute(1, 2, 0).unsqueeze(0).float(),
+        image=torch.from_numpy(image).permute(1, 2, 0).unsqueeze(0).expand(4, -1, -1, -1).float(),
+        mask=torch.from_numpy(mask).unsqueeze(0),
+        inner_width=48,
+        inner_flat_top_px=0,
+        seam_inset_px=0,
+        lowpass_sigma=3.0,
+        arc_smooth_px=12.0,
+        max_correction=0.5,
+        luma_strength=1.0,
+        chroma_strength=1.0,
+        u_strength=1.0,
+        v_strength=1.0,
+        color_space="linear",
+        yuv_matrix="bt601",
+        debug_previews=False,
+    )
+    assert out.shape[0] == 4
+    torch.testing.assert_close(out[0], out[3])

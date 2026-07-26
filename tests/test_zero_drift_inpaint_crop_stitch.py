@@ -389,3 +389,21 @@ def test_bucketing_four_tile_corner_maps_to_1536_square() -> None:
     mask[:, 124:1924, 124:1924] = 1.0
     _, cropped, _ = _crop_bucketed(image, mask)
     assert cropped.shape[1:3] == (1536, 1536)
+
+
+def test_batched_stitch_accepts_vae_center_cropped_results() -> None:
+    image = _gradient_image(320, 320).expand(2, -1, -1, -1).clone()
+    mask = torch.zeros(2, 320, 320)
+    mask[:, 10:186, 10:258] = 1.0
+    node = ZeroDriftInpaintCropNode()
+    stitcher, cropped, _ = node.inpaint_crop(
+        image, "bilinear", "bicubic", 0, 0, 1.0, True, mask, None, vae_size_multiple=8
+    )
+    decoded = _vae_center_crop(cropped, 16)
+    assert decoded.shape[0] == 2 and decoded.shape[1:3] == (176, 240)
+    inpainted = torch.full_like(decoded, 0.5)
+    result = ZeroDriftInpaintStitchNode().inpaint_stitch(stitcher, inpainted)[0]
+    assert result.shape[0] == 2
+    for i in range(2):
+        outside = mask[i] <= 0.5
+        torch.testing.assert_close(result[i][outside], image[i][outside])

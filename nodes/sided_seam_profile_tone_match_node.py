@@ -81,8 +81,11 @@ class SidedSeamProfileToneMatchNode:
         debug_previews,
         topology_mask=None,
     ):
-        if reference_image.shape != image.shape:
-            raise ValueError("reference_image and image must have the same shape")
+        if (reference_image.shape[1:] != image.shape[1:]
+                or reference_image.shape[0] not in (1, image.shape[0])):
+            raise ValueError(
+                "reference_image must match image in H,W,C and have batch 1 or the same batch"
+            )
 
         ref_bchw = reference_image.permute(0, 3, 1, 2).contiguous()
         img_bchw = image.permute(0, 3, 1, 2).contiguous()
