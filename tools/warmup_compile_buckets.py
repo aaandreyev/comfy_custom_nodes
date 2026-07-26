@@ -178,8 +178,15 @@ def main() -> None:
         name = upload_png(host, f"warmup_{w}x{h}.png", dummy_rgba_png(w, h))
         workflow[load_id]["inputs"]["image"] = name
         elapsed = submit_and_wait(host, workflow, args.timeout)
-        print(f"[{i}/{len(shapes)}] {w}x{h}: {elapsed:.1f}s", flush=True)
-    print(f"done in {(time.monotonic() - total_started) / 60.0:.1f} min")
+        total_elapsed = time.monotonic() - total_started
+        eta_min = (total_elapsed / i) * (len(shapes) - i) / 60.0
+        bar = ("#" * (20 * i // len(shapes))).ljust(20, ".")
+        print(
+            f"[{bar}] {i}/{len(shapes)} ({100 * i // len(shapes)}%) "
+            f"{w}x{h}: {elapsed:.1f}s | elapsed {total_elapsed / 60.0:.1f}m | ETA {eta_min:.0f}m",
+            flush=True,
+        )
+    print(f"done in {(time.monotonic() - total_started) / 60.0:.1f} min", flush=True)
 
 
 if __name__ == "__main__":
