@@ -23,6 +23,17 @@ class ZeroDriftInpaintCropNode:
                 "vae_size_multiple": ("INT", {"default": 16, "min": 1, "max": 128, "step": 1,
                                      "tooltip": "Spatial factor of the VAE in use: 16 for FLUX.2, 8 for SD-family. "
                                                 "Crop sizes are aligned to this multiple so VAEEncode does not crop pixels."}),
+                "size_bucket_px": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 16,
+                                   "tooltip": "0 = off. Otherwise the crop box is grown with real canvas pixels so its "
+                                              "width/height land on the {bucket_min_px, +step, ...} grid: torch.compile "
+                                              "then sees a small fixed set of shapes instead of recompiling per mask. "
+                                              "Use a multiple of 16 (e.g. 128)."}),
+                "bucket_min_px": ("INT", {"default": 512, "min": 16, "max": 4096, "step": 16,
+                                  "tooltip": "Smallest bucket side when size_bucket_px > 0: shorter crops are grown "
+                                             "with real context pixels up to this size."}),
+                "bucket_max_px": ("INT", {"default": 1536, "min": 64, "max": 8192, "step": 16,
+                                  "tooltip": "Longest bucket side when size_bucket_px > 0: bigger crops are uniformly "
+                                             "downscaled so the long side lands here; stitch maps them back."}),
             },
         }
 
@@ -48,6 +59,9 @@ class ZeroDriftInpaintCropNode:
         mask=None,
         optional_context_mask=None,
         vae_size_multiple=16,
+        size_bucket_px=0,
+        bucket_min_px=512,
+        bucket_max_px=1536,
     ):
         stitcher, cropped_image, cropped_mask = run_zero_drift_crop(
             image=image,
@@ -60,6 +74,9 @@ class ZeroDriftInpaintCropNode:
             optional_context_mask=optional_context_mask,
             align_crop_spatial_multiple_of_8=vae_alignment_multiple_of_8,
             spatial_size_multiple=int(vae_size_multiple),
+            size_bucket_px=int(size_bucket_px),
+            bucket_min_px=int(bucket_min_px),
+            bucket_max_px=int(bucket_max_px),
         )
         return (stitcher, cropped_image, cropped_mask)
 

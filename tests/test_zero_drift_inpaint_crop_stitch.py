@@ -282,3 +282,110 @@ def test_stitch_still_rejects_non_vae_shaped_mismatch() -> None:
         pass
     else:
         raise AssertionError("expected shape-mismatch AssertionError for non-VAE-shaped input")
+
+
+def _crop_bucketed(image, mask, *, bucket=128, bucket_min=512, **kw):
+    node = ZeroDriftInpaintCropNode()
+    return node.inpaint_crop(
+        image, "bilinear", "bicubic", 0, 0,
+        kw.pop("context_from_mask_extend_factor", 1.25),
+        True, mask, None,
+        vae_size_multiple=16, size_bucket_px=bucket, bucket_min_px=bucket_min,
+    )
+
+
+def test_bucketing_lands_on_grid_and_keeps_real_pixels() -> None:
+    image = _gradient_image(2048, 2048)
+    mask = torch.zeros(1, 2048, 2048)
+    mask[:, 900:990, 800:1000] = 1.0
+    stitcher, cropped, _ = _crop_bucketed(image, mask)
+    h, w = cropped.shape[1:3]
+    assert (h, w) == (512, 512)
+    x = stitcher["cropped_to_canvas_x"][0]
+    y = stitcher["cropped_to_canvas_y"][0]
+    torch.testing.assert_close(cropped, image[:, y : y + h, x : x + w, :])
+
+
+def test_bucketing_rounds_up_to_next_grid_step() -> None:
+    image = _gradient_image(2048, 2048)
+    mask = torch.zeros(1, 2048, 2048)
+    mask[:, 500:1100, 400:950] = 1.0
+    _, cropped, _ = _crop_bucketed(image, mask)
+    h, w = cropped.shape[1:3]
+    assert h % 128 == 0 and w % 128 == 0
+    assert h >= 600 * 1.25 and w >= 550 * 1.25
+    assert (h, w) == (768, 768)
+
+
+def test_bucketing_slides_window_at_canvas_corner() -> None:
+    image = _gradient_image(2048, 2048)
+    mask = torch.zeros(1, 2048, 2048)
+    mask[:, 0:80, 0:80] = 1.0
+    stitcher, cropped, _ = _crop_bucketed(image, mask)
+    assert cropped.shape[1:3] == (512, 512)
+    assert stitcher["cropped_to_canvas_x"][0] == 0
+    assert stitcher["cropped_to_canvas_y"][0] == 0
+
+
+def test_bucketing_capped_by_small_canvas() -> None:
+    image = _gradient_image(400, 400)
+    mask = torch.zeros(1, 400, 400)
+    mask[:, 100:300, 100:300] = 1.0
+    _, cropped, _ = _crop_bucketed(image, mask)
+    assert cropped.shape[1:3] == (400, 400)
+
+
+def test_bucketing_round_trip_stays_exact() -> None:
+    image = _gradient_image(1024, 1024)
+    mask = torch.zeros(1, 1024, 1024)
+    mask[:, 300:520, 350:600] = 1.0
+    stitcher, cropped, _ = _crop_bucketed(image, mask)
+    restored, = ZeroDriftInpaintStitchNode().inpaint_stitch(stitcher, cropped)
+    torch.testing.assert_close(restored, image)
+
+
+def test_bucketing_off_keeps_legacy_crop_box() -> None:
+    image = _gradient_image(1024, 1024)
+    mask = torch.zeros(1, 1024, 1024)
+    mask[:, 300:520, 350:600] = 1.0
+    node = ZeroDriftInpaintCropNode()
+    _, cropped_off, _ = node.inpaint_crop(
+        image, "bilinear", "bicubic", 0, 0, 1.25, True, mask, None,
+        vae_size_multiple=16, size_bucket_px=0,
+    )
+    _, cropped_legacy, _ = node.inpaint_crop(
+        image, "bilinear", "bicubic", 0, 0, 1.25, True, mask, None,
+        vae_size_multiple=16,
+    )
+    torch.testing.assert_close(cropped_off, cropped_legacy)
+
+
+def test_bucketing_batch_shares_one_bucketed_box() -> None:
+    image = _gradient_image(1024, 1024).expand(2, -1, -1, -1).clone()
+    mask = torch.zeros(2, 1024, 1024)
+    mask[0, 300:420, 350:500] = 1.0
+    mask[1, 500:640, 420:560] = 1.0
+    _, cropped, _ = _crop_bucketed(image, mask)
+    assert cropped.shape[0] == 2
+    assert cropped.shape[1] % 128 == 0 and cropped.shape[2] % 128 == 0
+
+
+def test_bucketing_downscales_oversized_crop_to_max_side() -> None:
+    image = _gradient_image(2048, 2048)
+    mask = torch.zeros(1, 2048, 2048)
+    mask[:, 200:1100, 100:1800] = 1.0
+    stitcher, cropped, _ = _crop_bucketed(image, mask)
+    h, w = cropped.shape[1:3]
+    assert w == 1536
+    assert h == 896
+    restored, = ZeroDriftInpaintStitchNode().inpaint_stitch(stitcher, cropped)
+    outside = ((restored - image).abs() * (1.0 - mask.unsqueeze(-1))).max().item()
+    assert outside <= 1e-4
+
+
+def test_bucketing_four_tile_corner_maps_to_1536_square() -> None:
+    image = _gradient_image(2048, 2048)
+    mask = torch.zeros(1, 2048, 2048)
+    mask[:, 124:1924, 124:1924] = 1.0
+    _, cropped, _ = _crop_bucketed(image, mask)
+    assert cropped.shape[1:3] == (1536, 1536)

@@ -202,6 +202,26 @@ def _align_crop_outputs_to_multiple(
     """Resize crop tensors so H,W are multiples of the VAE spatial factor."""
     tw = _nearest_spatial_multiple(natural_w, multiple)
     th = _nearest_spatial_multiple(natural_h, multiple)
+    return _resize_crop_outputs(
+        cropped_image, cropped_mask, blend_mask, crop_support_canvas,
+        tw=tw, th=th, natural_w=natural_w, natural_h=natural_h,
+        downscale_algorithm=downscale_algorithm, upscale_algorithm=upscale_algorithm,
+    )
+
+
+def _resize_crop_outputs(
+    cropped_image: torch.Tensor,
+    cropped_mask: torch.Tensor,
+    blend_mask: torch.Tensor,
+    crop_support_canvas: torch.Tensor,
+    *,
+    tw: int,
+    th: int,
+    natural_w: int,
+    natural_h: int,
+    downscale_algorithm: str,
+    upscale_algorithm: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     if tw == natural_w and th == natural_h:
         return cropped_image, cropped_mask, blend_mask, crop_support_canvas, tw, th
     algo = upscale_algorithm if tw >= natural_w and th >= natural_h else downscale_algorithm
@@ -211,6 +231,60 @@ def _align_crop_outputs_to_multiple(
     resized_blend = _resize_alpha(blend_mask, tw, th)
     resized_support = _resize_mask_nearest(crop_support_canvas, tw, th).clamp(0.0, 1.0)
     return resized_image, resized_mask, resized_blend, resized_support, tw, th
+
+
+def _grid_size(value: float, step: int, min_px: int, max_px: int) -> int:
+    return min(int(max_px), max(int(min_px), int(math.ceil(value / float(step))) * int(step)))
+
+
+def _expand_span(a0: int, a1: int, target: int, canvas: int) -> tuple[int, int]:
+    extra = target - (a1 - a0)
+    if extra <= 0:
+        return int(a0), int(a1)
+    n0 = a0 - extra // 2
+    n1 = n0 + target
+    if n0 < 0:
+        n0, n1 = 0, target
+    if n1 > canvas:
+        n1, n0 = canvas, canvas - target
+    return int(n0), int(n1)
+
+
+def _bucket_crop_box(
+    bbox: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    step: int,
+    min_px: int,
+    max_px: int,
+) -> tuple[tuple[int, int, int, int], tuple[int, int] | None]:
+    """Snap the crop to a fixed size grid so torch.compile sees few shapes.
+
+    Sides below the grid are grown with real canvas pixels (no resampling).
+    When the long side exceeds ``max_px`` the crop is scheduled for a uniform
+    downscale to the grid: the short side is first grown so both output sides
+    land on grid values at the same scale factor, keeping aspect distortion
+    within one grid step. Returns the adjusted box and, for the downscale
+    case, the forced output (width, height).
+    """
+    x0, y0, x1, y1 = bbox
+    w = x1 - x0
+    h = y1 - y0
+    long_side = max(w, h)
+    if long_side > max_px:
+        scale = float(max_px) / float(long_side)
+        out_w = _grid_size(w * scale, step, min_px, max_px)
+        out_h = _grid_size(h * scale, step, min_px, max_px)
+        src_w = min(int(width), int(round(out_w / scale)))
+        src_h = min(int(height), int(round(out_h / scale)))
+        x0, x1 = _expand_span(x0, x1, src_w, int(width))
+        y0, y1 = _expand_span(y0, y1, src_h, int(height))
+        return (x0, y0, x1, y1), (out_w, out_h)
+    tw = min(_grid_size(w, step, min_px, max_px), int(width))
+    th = min(_grid_size(h, step, min_px, max_px), int(height))
+    x0, x1 = _expand_span(x0, x1, tw, int(width))
+    y0, y1 = _expand_span(y0, y1, th, int(height))
+    return (x0, y0, x1, y1), None
 
 
 def _compute_crop_box(
@@ -258,6 +332,7 @@ def _prepare_single_crop(
     align_crop_spatial_multiple_of_8: bool,
     spatial_size_multiple: int = 8,
     crop_box: tuple[int, int, int, int] | None = None,
+    forced_output_size: tuple[int, int] | None = None,
 ) -> SingleCropResult:
     orig_box = (0, 0, int(image.shape[2]), int(image.shape[1]))
     selection_mask = _binary_mask_default(mask)
@@ -285,7 +360,22 @@ def _prepare_single_crop(
     cropped_mask_bin = (cropped_mask > 0.5).float()
 
     out_w, out_h = int(ctc_w), int(ctc_h)
-    if align_crop_spatial_multiple_of_8:
+    if forced_output_size is not None:
+        cropped_image, cropped_mask_bin, blend_mask, crop_support_canvas, out_w, out_h = (
+            _resize_crop_outputs(
+                cropped_image,
+                cropped_mask_bin,
+                blend_mask,
+                crop_support_canvas,
+                tw=int(forced_output_size[0]),
+                th=int(forced_output_size[1]),
+                natural_w=int(ctc_w),
+                natural_h=int(ctc_h),
+                downscale_algorithm=downscale_algorithm,
+                upscale_algorithm=upscale_algorithm,
+            )
+        )
+    elif align_crop_spatial_multiple_of_8:
         cropped_image, cropped_mask_bin, blend_mask, crop_support_canvas, out_w, out_h = (
             _align_crop_outputs_to_multiple(
                 cropped_image,
@@ -326,6 +416,9 @@ def run_zero_drift_crop(
     optional_context_mask: torch.Tensor | None,
     align_crop_spatial_multiple_of_8: bool = True,
     spatial_size_multiple: int = 8,
+    size_bucket_px: int = 0,
+    bucket_min_px: int = 512,
+    bucket_max_px: int = 1536,
 ) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
     image = image.clone()
     mask = _ensure_mask_shape(_clone_or_none(mask), image)
@@ -359,7 +452,7 @@ def run_zero_drift_crop(
     # cannot be stacked into one IMAGE batch. Share the union crop box so every
     # element yields the same crop size; for batch 1 behavior is unchanged.
     shared_crop_box: tuple[int, int, int, int] | None = None
-    if image.shape[0] > 1:
+    if image.shape[0] > 1 or size_bucket_px > 0:
         for index in range(image.shape[0]):
             box = _compute_crop_box(
                 image[index : index + 1],
@@ -369,6 +462,16 @@ def run_zero_drift_crop(
                 context_from_mask_extend_factor,
             )
             shared_crop_box = _union_bbox(shared_crop_box, box)
+    forced_output_size: tuple[int, int] | None = None
+    if size_bucket_px > 0 and shared_crop_box is not None:
+        shared_crop_box, forced_output_size = _bucket_crop_box(
+            shared_crop_box,
+            int(image.shape[2]),
+            int(image.shape[1]),
+            int(size_bucket_px),
+            int(bucket_min_px),
+            int(bucket_max_px),
+        )
 
     for index in range(image.shape[0]):
         result = _prepare_single_crop(
@@ -383,6 +486,7 @@ def run_zero_drift_crop(
             align_crop_spatial_multiple_of_8=align_crop_spatial_multiple_of_8,
             spatial_size_multiple=spatial_size_multiple,
             crop_box=shared_crop_box,
+            forced_output_size=forced_output_size,
         )
         stitcher["canvas_image"].append(result.canvas_image.cpu())
         stitcher["canvas_to_orig_x"].append(result.canvas_to_orig[0])
