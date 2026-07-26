@@ -13,6 +13,7 @@ from .flux2_compile_nodes import Flux2CLIPCompile, NunchakuFlux2ModelCompile
 from .flux2_nunchaku_te_loader_node import NunchakuQwen3TELoader
 from .seamfix_clip_text_encode_node import SeamfixCLIPTextEncode
 from .seam_profile_tone_match_node import SeamProfileToneMatchNode
+from .sided_seam_profile_tone_match_node import SidedSeamProfileToneMatchNode
 
 try:
     from .flux2_klein_spatial_denoise_ksampler_node import Flux2KleinSpatialDenoiseKSamplerNode
@@ -38,6 +39,7 @@ __all__ = [
     "MaskedColorTransferNode",
     "SeamfixCLIPTextEncode",
     "SeamProfileToneMatchNode",
+    "SidedSeamProfileToneMatchNode",
 ]
 
 if Flux2KleinSpatialDenoiseKSamplerNode is not None:

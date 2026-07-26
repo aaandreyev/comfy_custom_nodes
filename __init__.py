@@ -15,6 +15,7 @@ from .nodes.flux2_compile_nodes import Flux2CLIPCompile, NunchakuFlux2ModelCompi
 from .nodes.flux2_nunchaku_te_loader_node import NunchakuQwen3TELoader
 from .nodes.seamfix_clip_text_encode_node import SeamfixCLIPTextEncode
 from .nodes.seam_profile_tone_match_node import SeamProfileToneMatchNode
+from .nodes.sided_seam_profile_tone_match_node import SidedSeamProfileToneMatchNode
 from .nodes import SeamGuidedKSamplerNode
 
 try:
@@ -41,6 +42,7 @@ NODE_CLASS_MAPPINGS = {
     "NunchakuQwen3TELoader": NunchakuQwen3TELoader,
     "SeamfixCLIPTextEncode": SeamfixCLIPTextEncode,
     "SeamProfileToneMatch": SeamProfileToneMatchNode,
+    "SidedSeamProfileToneMatch": SidedSeamProfileToneMatchNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -61,6 +63,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NunchakuQwen3TELoader": "Nunchaku Qwen3 Text Encoder Loader (FLUX.2 klein)",
     "SeamfixCLIPTextEncode": "CLIP Text Encode (SEAMFIX / Inpaint Prompt)",
     "SeamProfileToneMatch": "Seam Profile Tone Match",
+    "SidedSeamProfileToneMatch": "Seam Profile Tone Match (Sided)",
 }
 
 if Flux2KleinSpatialDenoiseKSamplerNode is not None:
