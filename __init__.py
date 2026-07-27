@@ -73,3 +73,34 @@ if Flux2KleinSpatialDenoiseKSamplerNode is not None:
 if SeamGuidedKSamplerNode is not None:
     NODE_CLASS_MAPPINGS["SeamGuidedKSampler"] = SeamGuidedKSamplerNode
     NODE_DISPLAY_NAME_MAPPINGS["SeamGuidedKSampler"] = "Seam Guided KSampler"
+
+
+import os as _os
+
+if _os.environ.get("COMFY_MEGA_CACHE"):
+    try:
+        from .runtime.compile_cache import load_mega_cache as _load_mega_cache
+
+        print(
+            "[prefill-harmonization] mega-cache:",
+            _load_mega_cache(_os.environ["COMFY_MEGA_CACHE"]),
+        )
+    except Exception as _exc:  # noqa: BLE001 - never block node registration
+        print("[prefill-harmonization] mega-cache load failed:", _exc)
+
+try:
+    from aiohttp import web as _web
+    from server import PromptServer as _PromptServer
+
+    from .runtime.compile_cache import save_mega_cache as _save_mega_cache
+
+    @_PromptServer.instance.routes.post("/prefill_harmonization/save_mega_cache")
+    async def _save_mega_cache_route(request):
+        try:
+            data = await request.json()
+        except Exception:  # noqa: BLE001 - empty body is fine
+            data = {}
+        path = data.get("path") or _os.environ.get("COMFY_MEGA_CACHE_OUT") or "/tmp/mega_cache.bin"
+        return _web.json_response(_save_mega_cache(str(path)))
+except Exception:  # Bare test environments without a running ComfyUI server.
+    pass
