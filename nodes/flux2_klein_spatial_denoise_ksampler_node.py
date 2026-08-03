@@ -189,7 +189,11 @@ class Flux2KleinSpatialDenoiseKSamplerNode:
         sigma_map = (target_denoise_map * sigma_scale).clamp(0.0, 1.0)
 
         generator = torch.Generator(device="cpu").manual_seed(seed)
-        noise = torch.randn(latent.shape, generator=generator, dtype=torch.float32, device="cpu")
+        # Generated on CPU so a seed reproduces across devices, then moved to wherever the latent
+        # already is. ComfyUI hands the latent over on intermediate_device(), which --gpu-only
+        # moves to the GPU, so mixing the two here raises before the .to() calls below run.
+        noise = torch.randn(latent.shape, generator=generator, dtype=torch.float32,
+                            device="cpu").to(latent.device)
         # DD-style init: UNIFORM noise at start_sigma. Per-pixel handling happens
         # in the loop via re-noising frozen pixels each step. This way the model
         # always sees a consistent noise level — no biased predictions for partial
