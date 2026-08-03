@@ -198,7 +198,12 @@ class SeamGuidedKSamplerNode:
             schedule = schedule[start_idx:]
 
         generator = torch.Generator(device="cpu").manual_seed(seed)
-        noise = torch.randn(latent.shape, generator=generator, dtype=torch.float32, device="cpu")
+        # Same reason as in Flux2KleinSpatialDenoiseKSampler: CPU generation keeps the seed
+        # reproducible, but the mix with `latent` below needs both on one device. Here the
+        # denoise < 1.0 branch is the only one that mixes them, so the bug stays dormant at
+        # denoise 1.0 — which is what the shipped outpaint workflow uses.
+        noise = torch.randn(latent.shape, generator=generator, dtype=torch.float32,
+                            device="cpu").to(latent.device)
         if denoise < 1.0 and schedule:
             t_start = schedule[0]
             x = ((1.0 - t_start) * latent.float() + t_start * noise)
