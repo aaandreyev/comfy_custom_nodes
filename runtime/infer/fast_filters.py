@@ -77,7 +77,16 @@ def _blur_axis(tensor, kernel, axis: int):
 
 
 def gaussian(values: np.ndarray, sigma: float) -> np.ndarray:
-    """Drop-in for ``gaussian_filter(values, sigma)`` on 2-D or channel-first 3-D input."""
+    """Drop-in for ``gaussian_filter(values, sigma)`` on 2-D or channel-first 3-D input.
+
+    The input dtype is carried through rather than forced to float32. ``_extrapolate_to_boundary``
+    passes ``dist * near``, and ``dist`` comes from ``distance_transform_edt``, which is float64 by
+    definition; silently narrowing it costs ~1e-7 relative, which on distances of several hundred
+    pixels is ~1e-4 absolute. Small, but this function claims to reproduce scipy, so it does.
+
+    Integer input goes to scipy: the fast path would round through float and then truncate on the
+    way back, which differs from scipy by one LSB on roughly half the pixels.
+    """
     if sigma <= 0:
         return values.copy()
     squeeze = values.ndim == 2
@@ -88,6 +97,7 @@ def gaussian(values: np.ndarray, sigma: float) -> np.ndarray:
     usable = (
         torch is not None
         and torch.cuda.is_available()
+        and np.issubdtype(array.dtype, np.floating)
         and _radius(sigma) < min(array.shape[1], array.shape[2])
         and np.isfinite(array).all()
     )
@@ -95,13 +105,19 @@ def gaussian(values: np.ndarray, sigma: float) -> np.ndarray:
         out = np.stack([_scipy_gaussian(array[c], sigma) for c in range(array.shape[0])])
         return out[0] if squeeze else out
 
-    with torch.no_grad():
-        tensor = torch.from_numpy(np.ascontiguousarray(array, dtype=np.float32)).cuda()
-        kernel = _kernel1d(sigma, tensor.device, tensor.dtype)
-        tensor = _blur_axis(tensor, kernel, 1)
-        tensor = _blur_axis(tensor, kernel, 2)
-        out = tensor.cpu().numpy()
-    out = out.astype(values.dtype, copy=False)
+    # TF32 would take the convolution to ~1e-3 against scipy on Blackwell, four orders worse than
+    # what this promises, and nothing else in the process pins it. Scoped, not global.
+    previous = torch.backends.cudnn.allow_tf32
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        with torch.no_grad():
+            tensor = torch.from_numpy(np.ascontiguousarray(array)).cuda()
+            kernel = _kernel1d(sigma, tensor.device, tensor.dtype)
+            tensor = _blur_axis(tensor, kernel, 1)
+            tensor = _blur_axis(tensor, kernel, 2)
+            out = tensor.cpu().numpy()
+    finally:
+        torch.backends.cudnn.allow_tf32 = previous
     return out[0] if squeeze else out
 
 
