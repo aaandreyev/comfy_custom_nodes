@@ -17,6 +17,7 @@ from .nodes.draw_mask_overlay_advanced_node import DrawMaskOverlayAdvancedNode
 from .nodes.color_transfer_ref_from_mask_band_node import ColorTransferRefFromMaskBandNode
 from .nodes.zero_drift_inpaint_crop_stitch_node import ZeroDriftInpaintCropNode, ZeroDriftInpaintStitchNode
 from .nodes.masked_color_transfer_node import MaskedColorTransferNode
+from .nodes.repeat_image_to_match_batch_node import RepeatImageToMatchBatchNode
 from .nodes.flux2_active_region_rope_offset_node import Flux2ActiveRegionRoPEOffset
 from .nodes.flux2_compile_nodes import Flux2CLIPCompile, NunchakuFlux2ModelCompile
 from .nodes.flux2_nunchaku_te_loader_node import NunchakuQwen3TELoader
@@ -43,6 +44,7 @@ NODE_CLASS_MAPPINGS = {
     "ZeroDriftInpaintCrop": ZeroDriftInpaintCropNode,
     "ZeroDriftInpaintStitch": ZeroDriftInpaintStitchNode,
     "MaskedColorTransfer": MaskedColorTransferNode,
+    "RepeatImageToMatchBatch": RepeatImageToMatchBatchNode,
     "Flux2ActiveRegionRoPEOffset": Flux2ActiveRegionRoPEOffset,
     "Flux2CLIPCompile": Flux2CLIPCompile,
     "NunchakuFlux2ModelCompile": NunchakuFlux2ModelCompile,
