@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+# Must run before anything compiles. ComfyUI executes prompts on a worker thread and dynamo keeps
+# its overrides in a ContextVar, so the settings have to reach the entry's default rather than the
+# importing context — see runtime/dynamo_config.py for the measurement.
+from .runtime import dynamo_config
+
+dynamo_config.apply()
+
 from .nodes.freeform_neighbor_tone_match_node import FreeformNeighborToneMatchNode
 from .nodes.mask_harmonize import MaskHarmonize
 from .nodes.neighbor_tone_match_node import NeighborToneMatchNode
