@@ -22,7 +22,9 @@ import math
 
 import numpy as np
 import torch
-from scipy.ndimage import distance_transform_edt, gaussian_filter, grey_erosion
+from scipy.ndimage import distance_transform_edt, grey_erosion
+
+from .fast_filters import gaussian, gaussian_stack
 
 from .neighbor_tone_match import (
     _compress_to_unit_gamut,
@@ -40,8 +42,8 @@ _EPS = 1e-4
 
 def _normalized_lowpass(values: np.ndarray, support: np.ndarray, sigma: float) -> tuple[np.ndarray, np.ndarray]:
     """Gaussian average of ``values`` restricted to ``support``, extended smoothly outside it."""
-    den = gaussian_filter(support, sigma)
-    num = np.stack([gaussian_filter(values[c] * support, sigma) for c in range(values.shape[0])])
+    den = gaussian(support, sigma)
+    num = gaussian_stack(values, support, sigma)
     return num / np.maximum(den, _EPS)[None], den
 
 
@@ -64,8 +66,8 @@ def _extrapolate_to_boundary(
     far = (side & (dist > near_px) & (dist <= far_px)).astype(np.float32)
     v_near, den_near = _normalized_lowpass(values, near, sigma)
     v_far, den_far = _normalized_lowpass(values, far, sigma)
-    d_near = gaussian_filter(dist * near, sigma) / np.maximum(den_near, _EPS)
-    d_far = gaussian_filter(dist * far, sigma) / np.maximum(den_far, _EPS)
+    d_near = gaussian(dist * near, sigma) / np.maximum(den_near, _EPS)
+    d_far = gaussian(dist * far, sigma) / np.maximum(den_far, _EPS)
     ok = (den_near > _EPS) & (den_far > _EPS) & ((d_far - d_near) > 0.5)
     slope = (v_near - v_far) / np.maximum(d_far - d_near, 0.5)[None]
     v0 = np.where(ok[None], v_near + slope * d_near[None], v_near)
@@ -104,10 +106,8 @@ def _seam_delta_field(
 
     delta_raw = ref_at_seam - img_at_seam
     support = valid.astype(np.float32)
-    den_arc = gaussian_filter(support, arc_smooth_px)
-    num_arc = np.stack([
-        gaussian_filter(delta_raw[c] * support, arc_smooth_px) for c in range(3)
-    ])
+    den_arc = gaussian(support, arc_smooth_px)
+    num_arc = gaussian_stack(delta_raw[:3], support, arc_smooth_px)
     delta_line = num_arc / np.maximum(den_arc, _EPS)[None]
 
     nearest = distance_transform_edt(~valid, return_indices=True, return_distances=False)
