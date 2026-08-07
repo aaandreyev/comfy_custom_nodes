@@ -912,14 +912,19 @@ def prepare_seam_anchor_state(
         dtype=anchor_latent.dtype,
     )
 
+    # A supplied topology mask is authoritative: empty present positions mean
+    # "no real neighbor anywhere" — no side is anchored (matches the fallback of
+    # Flux2KleinSpatialDenoiseKSampler). Only a missing topology mask falls back
+    # to flag+bbox gating.
+    topo_gate = present_positions if topology_mask is not None else None
     sides: list[Side] = []
-    if process_left and x0 > 0 and (not present_positions or "w" in present_positions):
+    if process_left and x0 > 0 and (topo_gate is None or "w" in topo_gate):
         sides.append("left")
-    if process_right and x1 < anchor_latent.shape[-1] and (not present_positions or "e" in present_positions):
+    if process_right and x1 < anchor_latent.shape[-1] and (topo_gate is None or "e" in topo_gate):
         sides.append("right")
-    if process_top and y0 > 0 and (not present_positions or "n" in present_positions):
+    if process_top and y0 > 0 and (topo_gate is None or "n" in topo_gate):
         sides.append("top")
-    if process_bottom and y1 < anchor_latent.shape[-2] and (not present_positions or "s" in present_positions):
+    if process_bottom and y1 < anchor_latent.shape[-2] and (topo_gate is None or "s" in topo_gate):
         sides.append("bottom")
 
     per_side_profiles: dict[Side, torch.Tensor] = {}

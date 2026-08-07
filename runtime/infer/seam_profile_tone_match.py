@@ -314,14 +314,19 @@ def apply_sided_seam_profile_tone_match(
         device=soft_mask.device,
         dtype=torch.float32,
     )
+    # A supplied topology mask is authoritative: if it marks no real content in
+    # any zone around the bbox, there is nothing to match against and no side is
+    # processed — same semantics as Flux2KleinSpatialDenoiseKSampler, instead of
+    # silently falling back to flag-only gating.
+    topo_gate = present_positions if topology_mask is not None else None
     sides: list[str] = []
-    if process_left and x0 > 0 and (not present_positions or SIDE_TOPOLOGY["left"] in present_positions):
+    if process_left and x0 > 0 and (topo_gate is None or SIDE_TOPOLOGY["left"] in topo_gate):
         sides.append("left")
-    if process_right and x1 < width and (not present_positions or SIDE_TOPOLOGY["right"] in present_positions):
+    if process_right and x1 < width and (topo_gate is None or SIDE_TOPOLOGY["right"] in topo_gate):
         sides.append("right")
-    if process_top and y0 > 0 and (not present_positions or SIDE_TOPOLOGY["top"] in present_positions):
+    if process_top and y0 > 0 and (topo_gate is None or SIDE_TOPOLOGY["top"] in topo_gate):
         sides.append("top")
-    if process_bottom and y1 < height and (not present_positions or SIDE_TOPOLOGY["bottom"] in present_positions):
+    if process_bottom and y1 < height and (topo_gate is None or SIDE_TOPOLOGY["bottom"] in topo_gate):
         sides.append("bottom")
     if not sides:
         return image_rgb, {

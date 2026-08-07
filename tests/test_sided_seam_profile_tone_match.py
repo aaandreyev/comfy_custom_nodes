@@ -214,3 +214,15 @@ def test_batched_image_with_single_reference() -> None:
     imgs_t = torch.from_numpy(imgs).float()
     assert (corrected[0, 0][band] - imgs_t[0, 0][band]).mean() > 0.005
     assert (corrected[1, 0][band] - imgs_t[1, 0][band]).mean() < -0.005
+
+
+def test_topology_mask_with_no_real_content_is_noop() -> None:
+    base = _base_image()
+    mask = _center_strip_mask()
+    image = _biased_image(base, mask, -0.06)
+    # Topology supplied but empty: authoritative "no real neighbors" -> no-op.
+    # Feeding the generation mask itself as topology reduces to the same case.
+    for topo in (torch.zeros(1, SIZE, SIZE), torch.from_numpy(mask).unsqueeze(0)):
+        corrected, debug = _run(base, image, mask, topology=topo)
+        assert debug["reason"] == "no_processable_sides"
+        assert np.array_equal(corrected, image)
