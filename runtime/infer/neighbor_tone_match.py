@@ -174,6 +174,22 @@ def _global_correction_from_samples(
     return torch.cat([luma_ratio, chroma_delta], dim=1)
 
 
+# Below this mean absolute YUV difference the donor band carries no drift to
+# learn from, so any lookup built from it is the identity.
+NO_DRIFT_TOLERANCE = 1e-3
+
+
+def _donor_band_drift(drift_samples: torch.Tensor, reference_samples: torch.Tensor) -> float:
+    """Mean absolute drift available in the donor band, in YUV units.
+
+    The lookup is learned by comparing the drifted image to the reference
+    outside the mask. When a caller passes a composite whose outside is the
+    untouched reference, that comparison is between identical pixels, the
+    lookup collapses to the identity and the node cannot change anything.
+    """
+    return float((drift_samples.float() - reference_samples.float()).abs().mean())
+
+
 def _build_delta_lookup(
     drift_samples: torch.Tensor,
     reference_samples: torch.Tensor,
@@ -440,8 +456,16 @@ def _gather_outer_samples_per_element(
     if not valid or not min_n:
         return None
 
-    placeholder = valid[0][:, :, :min_n]
-    result = [t[:, :, :min_n] if t is not None else placeholder for t in per_elem]
+    def to_min_n(samples):
+        # Subsample across the whole run instead of taking a prefix: the strips
+        # are concatenated side by side, so a prefix would drop whole sides.
+        if samples.shape[-1] == min_n:
+            return samples
+        index = torch.linspace(0, samples.shape[-1] - 1, min_n, device=samples.device)
+        return samples[:, :, index.round().long()]
+
+    placeholder = to_min_n(valid[0])
+    result = [to_min_n(t) if t is not None else placeholder for t in per_elem]
     return torch.cat(result, dim=0)
 
 
@@ -690,6 +714,16 @@ def apply_neighbor_tone_match(
     drift_outer_samples = _gather_outer_samples_per_element(drift_source_yuv, mask_crop, sides, outer_width, bbox_c)
     lookup = None
     if reference_outer_samples is not None and drift_outer_samples is not None:
+        donor_drift = _donor_band_drift(drift_outer_samples, reference_outer_samples)
+        if donor_drift < NO_DRIFT_TOLERANCE:
+            return generated_rgb, {
+                "reason": "no_drift_in_donor_band",
+                "donor_band_drift": donor_drift,
+                "side_deltas": {},
+                "weights": {},
+                "bbox": bbox,
+                "present_positions": tuple(sorted(present_positions)),
+            }
         lookup = _build_delta_lookup(
             drift_outer_samples,
             reference_outer_samples,
@@ -851,7 +885,8 @@ def apply_freeform_neighbor_tone_match(
             ref_yuv = _rgb_to_yuv(ref_crop, matrix=yuv_matrix)
             img_yuv = _rgb_to_yuv(img_crop, matrix=yuv_matrix)
 
-        mask_np = mask_crop[0, 0].detach().cpu().numpy().astype(np.float32)
+        # .float() before numpy: bfloat16 has no numpy dtype and would raise.
+        mask_np = mask_crop[0, 0].detach().float().cpu().numpy()
         mask_bool = mask_np > 1e-3
         outside = ~mask_bool
         dist_out = distance_transform_edt(outside).astype(np.float32)
@@ -869,6 +904,15 @@ def apply_freeform_neighbor_tone_match(
         outer_band_t = torch.from_numpy(outer_band).to(device=ref_yuv.device)
         ref_samples = ref_yuv[:, :, outer_band_t].reshape(1, 3, -1)
         img_samples = img_yuv[:, :, outer_band_t].reshape(1, 3, -1)
+        donor_drift = _donor_band_drift(img_samples, ref_samples)
+        if donor_drift < NO_DRIFT_TOLERANCE:
+            debug_items.append({
+                "reason": "no_drift_in_donor_band",
+                "bbox": bbox,
+                "donor_band_drift": donor_drift,
+                "outer_samples": int(outer_band.sum()),
+            })
+            continue
         lookup = _build_delta_lookup(
             img_samples,
             ref_samples,

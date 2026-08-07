@@ -111,6 +111,59 @@ def test_freeform_untouched_outside_mask_and_border_mask() -> None:
     assert torch.equal(out.masked_select(outside.expand_as(out)), img.masked_select(outside.expand_as(img)))
 
 
+def test_freeform_reports_composite_wiring_instead_of_claiming_success() -> None:
+    """A composite whose outside is the untouched reference has no drift to learn.
+
+    The lookup is built by comparing image to reference outside the mask, so
+    this input can only ever produce the identity. Reporting "applied" here hid
+    a wiring mistake behind a green run: the node changed nothing while the
+    caller believed the seam had been corrected.
+    """
+    ref, img, _, blob_mask = make_inputs()
+    composite = ref * (1.0 - blob_mask) + img * blob_mask
+    out, debug = apply_freeform_neighbor_tone_match(
+        ref, composite, blob_mask,
+        inner_width=32, outer_band_px=24, inner_flat_top_px=0,
+        luma_strength=1.0, chroma_strength=1.0,
+        bins=16, correction_mode="hybrid", lut_mode="3d",
+        color_space="linear", yuv_matrix="bt601",
+        delta_smoothing_sigma=0.5,
+    )
+    assert debug["reason"] == "no_drift_in_donor_band"
+    assert torch.equal(out, composite)
+
+
+def test_rect_reports_composite_wiring_instead_of_claiming_success() -> None:
+    ref, img, rect_mask, _ = make_inputs()
+    out, debug = apply_neighbor_tone_match(
+        ref, ref.clone(), img, rect_mask,
+        inner_width=48, outer_band_px=64, inner_flat_top_px=8,
+        process_left=True, process_right=True, process_top=True, process_bottom=True,
+        luma_strength=1.0, chroma_strength=1.0,
+        bins=16, correction_mode="hybrid", lut_mode="3d",
+        color_space="linear", yuv_matrix="bt601",
+        delta_smoothing_sigma=0.0, corner_px=0.0,
+    )
+    assert debug["reason"] == "no_drift_in_donor_band"
+    assert torch.equal(out, img)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_freeform_accepts_half_precision_inputs(dtype: torch.dtype) -> None:
+    """bfloat16 has no numpy dtype; the distance transforms must not see it raw."""
+    ref, img, _, blob_mask = make_inputs()
+    out, debug = apply_freeform_neighbor_tone_match(
+        ref.to(dtype), img.to(dtype), blob_mask.to(dtype),
+        inner_width=32, outer_band_px=24, inner_flat_top_px=0,
+        luma_strength=1.0, chroma_strength=1.0,
+        bins=16, correction_mode="hybrid", lut_mode="3d",
+        color_space="linear", yuv_matrix="bt601",
+        delta_smoothing_sigma=0.5,
+    )
+    assert debug["reason"] == "applied"
+    assert out.dtype == dtype
+
+
 def test_rect_full_frame_mask_passthrough() -> None:
     ref, img, _, _ = make_inputs(128, 128)
     full_mask = torch.ones(1, 1, 128, 128)

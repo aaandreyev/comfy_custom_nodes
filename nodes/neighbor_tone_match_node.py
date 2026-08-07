@@ -138,6 +138,13 @@ class NeighborToneMatchNode:
             delta_smoothing_sigma=float(delta_smoothing_sigma),
             corner_px=corner_px_val,
         )
+        if debug.get("reason") == "no_drift_in_donor_band":
+            print(
+                "[NeighborToneMatch] reference_image and drift_source are identical "
+                "outside the mask, so there is no drift to learn and nothing was "
+                "changed. drift_source must be the drifted rendition of the "
+                "reference (for example its VAE round-trip), not the reference itself."
+            )
         if debug_previews:
             write_neighbor_tone_debug(ref_rgb, img_rgb, corrected_rgb, debug)
         corrected = torch.cat([corrected_rgb, alpha], dim=1) if alpha is not None else corrected_rgb

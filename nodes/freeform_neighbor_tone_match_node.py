@@ -107,6 +107,14 @@ class FreeformNeighborToneMatchNode:
             yuv_matrix=str(yuv_matrix),
             delta_smoothing_sigma=float(delta_smoothing_sigma),
         )
+        if debug.get("reason") == "no_drift_in_donor_band":
+            print(
+                "[FreeformNeighborToneMatch] reference_image and image are identical "
+                "outside the mask, so there is no drift to learn and nothing was "
+                "changed. Feed the full drifted frame as `image` (for example the "
+                "VAE round-trip or raw generator output), not a composite whose "
+                "outside is already the reference."
+            )
         if debug_previews:
             write_neighbor_tone_debug(ref_rgb, img_rgb, corrected_rgb, debug)
         corrected = torch.cat([corrected_rgb, alpha], dim=1) if alpha is not None else corrected_rgb
